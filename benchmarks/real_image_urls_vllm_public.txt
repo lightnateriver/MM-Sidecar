@@ -1,0 +1,13 @@
+https://vllm-public-assets.s3.us-west-2.amazonaws.com/multimodal_asset/cat_snow.jpg
+https://vllm-public-assets.s3.us-west-2.amazonaws.com/multimodal_asset/duck.jpg
+https://vllm-public-assets.s3.us-west-2.amazonaws.com/multimodal_asset/eskimo.jpg
+https://vllm-public-assets.s3.us-west-2.amazonaws.com/multimodal_asset/flycatcher.jpeg
+https://vllm-public-assets.s3.us-west-2.amazonaws.com/multimodal_asset/guineapig.jpg
+https://vllm-public-assets.s3.us-west-2.amazonaws.com/multimodal_asset/horsepony.jpg
+https://vllm-public-assets.s3.us-west-2.amazonaws.com/multimodal_asset/husky.jpg
+https://vllm-public-assets.s3.us-west-2.amazonaws.com/multimodal_asset/lion.jpg
+https://vllm-public-assets.s3.us-west-2.amazonaws.com/multimodal_asset/orangetabbycat.jpg
+https://vllm-public-assets.s3.us-west-2.amazonaws.com/multimodal_asset/rabbit.jpg
+https://vllm-public-assets.s3.us-west-2.amazonaws.com/multimodal_asset/red_chair.jpg
+https://vllm-public-assets.s3.us-west-2.amazonaws.com/multimodal_asset/snail.jpg
+https://vllm-public-assets.s3.us-west-2.amazonaws.com/multimodal_asset/somefish.jpg

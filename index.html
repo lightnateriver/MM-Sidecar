@@ -1,0 +1,1615 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ACMP / mm-sidecar 完整方案设计</title>
+  <style>
+    :root {
+      --bg: #ffffff;
+      --bg-soft: #f6fbfc;
+      --panel: rgba(255, 255, 255, 0.97);
+      --panel-soft: #f8fcfd;
+      --line: #d8e6ea;
+      --line-strong: #c0d5db;
+      --text: #102126;
+      --muted: #647880;
+      --muted-strong: #44575d;
+      --blue: #1e63d1;
+      --teal: #0f948a;
+      --orange: #ea7a1a;
+      --blue-soft: #ecf4ff;
+      --teal-soft: #eafbf8;
+      --orange-soft: #fff4e9;
+      --shadow: 0 20px 56px rgba(16, 33, 38, 0.07);
+      --radius-xl: 26px;
+      --radius-lg: 18px;
+      --radius-md: 12px;
+      --max: 1420px;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    html {
+      scroll-behavior: smooth;
+    }
+
+    body {
+      margin: 0;
+      font-family: "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+      color: var(--text);
+      line-height: 1.64;
+      background:
+        radial-gradient(circle at top left, rgba(30, 99, 209, 0.05), transparent 26%),
+        radial-gradient(circle at top right, rgba(15, 148, 138, 0.05), transparent 28%),
+        linear-gradient(180deg, #ffffff 0%, #fbfdfe 42%, #f7fbfc 100%);
+    }
+
+    a {
+      color: var(--blue);
+      text-decoration: none;
+    }
+
+    code {
+      font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+      font-size: 0.95em;
+      background: #f4f8f9;
+      padding: 0.08em 0.38em;
+      border-radius: 6px;
+      border: 1px solid #e4eef1;
+    }
+
+    .page {
+      width: min(var(--max), calc(100vw - 36px));
+      margin: 0 auto;
+      padding: 24px 0 72px;
+    }
+
+    .hero,
+    .panel,
+    details,
+    .footer {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: var(--radius-xl);
+      box-shadow: var(--shadow);
+    }
+
+    .hero {
+      position: relative;
+      overflow: hidden;
+      padding: 30px 32px;
+      margin-bottom: 22px;
+    }
+
+    .hero::before {
+      content: "";
+      position: absolute;
+      inset: 0;
+      background:
+        radial-gradient(circle at 10% 15%, rgba(30, 99, 209, 0.08), transparent 30%),
+        radial-gradient(circle at 82% 14%, rgba(15, 148, 138, 0.08), transparent 26%),
+        linear-gradient(180deg, rgba(255,255,255,0.36), rgba(247,251,252,0.20));
+      pointer-events: none;
+    }
+
+    .hero-layout {
+      position: relative;
+      z-index: 1;
+      display: grid;
+      grid-template-columns: minmax(0, 1.35fr) minmax(320px, 0.95fr);
+      gap: 26px;
+      align-items: stretch;
+    }
+
+    .eyebrow {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      border: 1px solid var(--line);
+      background: var(--panel-soft);
+      border-radius: 999px;
+      padding: 7px 12px;
+      color: var(--muted);
+      font-size: 12px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      margin-bottom: 18px;
+    }
+
+    .dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 999px;
+      background: linear-gradient(135deg, var(--blue), var(--teal));
+    }
+
+    h1 {
+      margin: 0;
+      font-size: clamp(32px, 4.15vw, 52px);
+      line-height: 1.08;
+      letter-spacing: -0.034em;
+      max-width: 18ch;
+      text-wrap: balance;
+    }
+
+    .hero-subtitle {
+      margin-top: 14px;
+      font-size: clamp(15px, 1.55vw, 19px);
+      line-height: 1.5;
+      color: var(--blue);
+      font-weight: 600;
+      max-width: 52ch;
+    }
+
+    .hero p {
+      margin: 14px 0 0;
+      font-size: 16px;
+      color: var(--muted);
+      max-width: 82ch;
+    }
+
+    .tag-row,
+    .pill-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 9px;
+      margin-top: 18px;
+    }
+
+    .tag,
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 8px 12px;
+      background: #fff;
+      color: var(--text);
+      font-size: 12px;
+    }
+
+    .hero-rail {
+      display: grid;
+      gap: 14px;
+    }
+
+    .hero-rail-card,
+    .card,
+    .metric,
+    .stage {
+      border: 1px solid var(--line);
+      border-radius: var(--radius-lg);
+      background: linear-gradient(180deg, #ffffff, #f9fcfd);
+      padding: 18px;
+    }
+
+    .hero-rail-card {
+      background: linear-gradient(180deg, rgba(255,255,255,0.92), rgba(246,251,252,0.96));
+    }
+
+    .hero-rail-card h3,
+    .card h3,
+    .card h4,
+    .stage h3 {
+      margin: 0 0 10px;
+      letter-spacing: -0.02em;
+    }
+
+    .hero-rail-card h3 {
+      font-size: 16px;
+    }
+
+    .hero-rail-card p,
+    .hero-rail-card li,
+    .card p,
+    .card li,
+    .stage p,
+    .stage li {
+      color: var(--muted-strong);
+      font-size: 14px;
+      margin-top: 0;
+    }
+
+    .hero-rail-card ul,
+    .card ul,
+    .stage ul {
+      margin: 0;
+      padding-left: 18px;
+    }
+
+    .hero-mini-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px;
+    }
+
+    .hero-mini {
+      border: 1px solid var(--line);
+      border-radius: var(--radius-md);
+      background: #fff;
+      padding: 12px;
+    }
+
+    .hero-mini b {
+      display: block;
+      font-size: 12px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--muted);
+      margin-bottom: 6px;
+    }
+
+    .hero-mini span {
+      display: block;
+      font-size: 14px;
+      color: var(--text);
+      line-height: 1.45;
+    }
+
+    .panel {
+      padding: 22px 24px;
+      margin-bottom: 22px;
+    }
+
+    .section-title {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 14px;
+      margin-bottom: 14px;
+    }
+
+    .section-title h2,
+    .section-title h3 {
+      margin: 0;
+      letter-spacing: -0.02em;
+    }
+
+    .section-title h2 {
+      font-size: 26px;
+    }
+
+    .section-title small {
+      font-size: 13px;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+    }
+
+    .lede {
+      margin: 0 0 16px;
+      color: var(--muted);
+      font-size: 15px;
+      max-width: 95ch;
+    }
+
+    .metric-grid,
+    .grid-2,
+    .grid-3,
+    .grid-4,
+    .compare,
+    .split {
+      display: grid;
+      gap: 16px;
+    }
+
+    .metric-grid,
+    .compare {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    .grid-2 {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    .grid-3 {
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+    }
+
+    .grid-4 {
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+    }
+
+    .split {
+      grid-template-columns: 1.08fr 0.92fr;
+    }
+
+    .card.blue,
+    .metric.blue {
+      background: linear-gradient(180deg, #ffffff, var(--blue-soft));
+    }
+
+    .card.teal,
+    .metric.teal {
+      background: linear-gradient(180deg, #ffffff, var(--teal-soft));
+    }
+
+    .card.orange,
+    .metric.orange {
+      background: linear-gradient(180deg, #ffffff, var(--orange-soft));
+    }
+
+    .metric b {
+      display: block;
+      font-size: 26px;
+      line-height: 1;
+      margin-bottom: 7px;
+      letter-spacing: -0.04em;
+    }
+
+    .metric span {
+      display: block;
+      font-size: 12px;
+      color: var(--muted);
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      margin-bottom: 6px;
+    }
+
+    .metric p {
+      margin: 0;
+      font-size: 13px;
+      color: var(--muted-strong);
+    }
+
+    .stage .label {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--muted);
+      margin-bottom: 10px;
+    }
+
+    .stage .swatch {
+      width: 12px;
+      height: 12px;
+      border-radius: 4px;
+      border: 1px solid var(--line);
+      display: inline-block;
+    }
+
+    .ascii-block {
+      background: #0f1820;
+      color: #dff6ff;
+      border-radius: var(--radius-lg);
+      border: 1px solid #21313c;
+      padding: 20px;
+      overflow-x: auto;
+      box-shadow: inset 0 0 0 1px rgba(255,255,255,0.03);
+    }
+
+    pre {
+      margin: 0;
+      white-space: pre;
+      font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+      font-size: 13px;
+      line-height: 1.43;
+    }
+
+    details {
+      margin-bottom: 16px;
+      overflow: hidden;
+    }
+
+    summary {
+      list-style: none;
+      cursor: pointer;
+      user-select: none;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 14px;
+      padding: 18px 22px;
+      background: linear-gradient(180deg, #ffffff, #f7fbfc);
+    }
+
+    summary::-webkit-details-marker {
+      display: none;
+    }
+
+    .summary-left {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      min-width: 0;
+    }
+
+    .summary-index {
+      flex: 0 0 auto;
+      width: 36px;
+      height: 36px;
+      border-radius: 12px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      background: linear-gradient(135deg, var(--blue), var(--teal));
+      color: #fff;
+      font-size: 13px;
+      font-weight: 700;
+    }
+
+    .summary-copy b {
+      display: block;
+      font-size: 16px;
+      margin-bottom: 2px;
+    }
+
+    .summary-copy span {
+      display: block;
+      color: var(--muted);
+      font-size: 13px;
+      font-weight: 400;
+    }
+
+    .chev {
+      width: 12px;
+      height: 12px;
+      border-right: 2px solid var(--muted);
+      border-bottom: 2px solid var(--muted);
+      transform: rotate(45deg);
+      transition: transform 0.18s ease;
+      margin-right: 6px;
+      flex: 0 0 auto;
+    }
+
+    details[open] .chev {
+      transform: rotate(-135deg);
+      margin-top: 6px;
+    }
+
+    .body {
+      padding: 22px;
+      border-top: 1px solid var(--line);
+      background: rgba(255,255,255,0.92);
+    }
+
+    .table-like,
+    .timeline {
+      display: grid;
+      gap: 10px;
+    }
+
+    .row {
+      display: grid;
+      grid-template-columns: 220px 1fr;
+      gap: 14px;
+      align-items: start;
+      padding: 12px 14px;
+      border: 1px solid var(--line);
+      border-radius: var(--radius-md);
+      background: #fff;
+    }
+
+    .row .k {
+      font-weight: 600;
+      color: var(--text);
+    }
+
+    .row .v {
+      color: var(--muted);
+      font-size: 14px;
+    }
+
+    .timeline-step {
+      display: grid;
+      grid-template-columns: 54px 1fr;
+      gap: 12px;
+      align-items: start;
+    }
+
+    .timeline-step .n {
+      width: 42px;
+      height: 42px;
+      border-radius: 14px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      background: linear-gradient(135deg, var(--blue), var(--teal));
+      color: #fff;
+      font-weight: 700;
+    }
+
+    .timeline-step .content {
+      border: 1px solid var(--line);
+      border-radius: var(--radius-md);
+      padding: 14px;
+      background: #fff;
+    }
+
+    .timeline-step .content b {
+      display: block;
+      margin-bottom: 6px;
+      font-size: 15px;
+    }
+
+    .timeline-step .content p {
+      margin: 0;
+      color: var(--muted);
+      font-size: 14px;
+    }
+
+    .footer {
+      margin-top: 22px;
+      padding: 20px 22px;
+      color: var(--muted);
+      font-size: 14px;
+      background: linear-gradient(180deg, #ffffff, #f8fbfd);
+    }
+
+    @media (max-width: 1180px) {
+      .hero-layout,
+      .metric-grid,
+      .compare,
+      .grid-2,
+      .grid-3,
+      .grid-4,
+      .split {
+        grid-template-columns: 1fr;
+      }
+    }
+
+    @media (max-width: 760px) {
+      .page {
+        width: min(var(--max), calc(100vw - 20px));
+        padding-top: 12px;
+      }
+
+      .hero,
+      .panel,
+      .body,
+      summary,
+      .footer {
+        padding-left: 16px;
+        padding-right: 16px;
+      }
+
+      h1 {
+        font-size: 28px;
+        max-width: none;
+      }
+
+      .hero-subtitle {
+        font-size: 16px;
+        max-width: none;
+      }
+
+      .row {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <section class="hero">
+      <div class="hero-layout">
+        <div>
+          <div class="eyebrow"><span class="dot"></span> ACMP / architecture narrative</div>
+          <h1>从原始 stock vLLM，到 API Server多模态数据处理下沉，再到 mm-sidecar</h1>
+          <div class="hero-subtitle">ACMP 不是单点优化，而是一套“底座保底链 + 异步增强链”的完整多模态处理架构</div>
+          <p>
+            这份页面不是摘要海报，而是一份面向新用户、设计评审和后续实现同学的完整讲解页。它按演进顺序回答：
+            原始 vLLM 多模态链路的问题是什么、现有 <code>API Server多模态数据处理下沉</code> 已经做对了什么、
+            为什么这些改进仍不足以彻底解决多并发图像 preprocess 波动，以及为什么需要引入
+            <code>mm-sidecar</code> 作为建立在现有底座之上的异步协同预处理增强层。
+          </p>
+          <div class="tag-row">
+            <span class="tag">original vLLM pipeline</span>
+            <span class="tag">API offload baseline</span>
+            <span class="tag">async sidecar enhancement</span>
+            <span class="tag">artifact + cache + fallback</span>
+            <span class="tag">correctness first</span>
+          </div>
+        </div>
+        <aside class="hero-rail">
+          <div class="hero-rail-card">
+            <h3>这份文档的阅读目标</h3>
+            <ul>
+              <li>让新同学从零看懂 ACMP 的完整心智模型。</li>
+              <li>让设计评审能逐项检查边界、风险、fallback 和 correctness。</li>
+              <li>让后续实现者能直接据此拆分模块与定义接口。</li>
+            </ul>
+          </div>
+          <div class="hero-rail-card">
+            <h3>一句话结论</h3>
+            <p>
+              <code>mm-sidecar</code> 不是替代现有下沉方案的新主链，而是建立在
+              <code>API Server多模态数据处理下沉</code> 底座之上的异步预处理增强链；
+              sidecar 能命中就吃收益，来不及就快速回退到底座保底链。
+            </p>
+          </div>
+          <div class="hero-rail-card">
+            <h3>三段式演进</h3>
+            <div class="hero-mini-grid">
+              <div class="hero-mini">
+                <b>Stage 1</b>
+                <span>stock vLLM 将多模态热点压在 API Server。</span>
+              </div>
+              <div class="hero-mini">
+                <b>Stage 2</b>
+                <span>API Server多模态数据处理下沉把主执行面移回 worker。</span>
+              </div>
+              <div class="hero-mini">
+                <b>Stage 3</b>
+                <span>mm-sidecar 把 preprocess 提前做成异步平面与 CPU artifact 缓存层。</span>
+              </div>
+              <div class="hero-mini">
+                <b>Guarantee</b>
+                <span>sidecar 未命中或失败，立即退回 phase4/offload 保底链。</span>
+              </div>
+            </div>
+          </div>
+        </aside>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="section-title">
+        <h2>文档导航</h2>
+        <small>Full Design Scope</small>
+      </div>
+      <div class="metric-grid">
+        <article class="metric blue">
+          <b>01</b>
+          <span>背景与演进</span>
+          <p>从 stock vLLM 到 API offload，再到 sidecar 的完整演进脉络。</p>
+        </article>
+        <article class="metric teal">
+          <b>02</b>
+          <span>问题定义</span>
+          <p>明确负载波动、并发治理、artifact 复用和低风险接入这四类核心问题。</p>
+        </article>
+        <article class="metric orange">
+          <b>03</b>
+          <span>设计本体</span>
+          <p>覆盖架构、时序、artifact、metadata、cache key、并发、缓存与 fallback。</p>
+        </article>
+        <article class="metric blue">
+          <b>04</b>
+          <span>工程化落地</span>
+          <p>覆盖 prefix caching、版本治理、correctness、性能收益、观测、上线与回滚。</p>
+        </article>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="section-title">
+        <h2>架构结论</h2>
+        <small>Executive Summary</small>
+      </div>
+      <p class="lede">
+        ACMP 的核心并不是“把 preprocess 搬到别处”，而是定义一个清晰的两层结构：
+        <strong>现有 <code>API Server多模态数据处理下沉</code> 继续作为稳定底座和 fallback 保底链，
+        <code>mm-sidecar</code> 则作为异步协同预处理增强层，专门负责尽早启动 preprocess、提供 CPU artifact 级缓存复用、
+        统一治理多并发下的队列与生命周期，并在 TP Worker 到达消费点时按需汇合。</strong>
+      </p>
+      <div class="compare">
+        <article class="stage">
+          <div class="label"><span class="swatch" style="background:#f4f8f9"></span>stock</div>
+          <h3>原始链路</h3>
+          <ul>
+            <li>API Server 做读图、decode、resize、HF preprocess、hash、copy。</li>
+            <li>多模态 CPU 热点集中在 API 侧。</li>
+            <li>多并发下 TTFT 和 tail latency 波动明显。</li>
+          </ul>
+        </article>
+        <article class="stage">
+          <div class="label"><span class="swatch" style="background:var(--blue-soft)"></span>api offload</div>
+          <h3>现有底座</h3>
+          <ul>
+            <li>把多模态主处理面下沉到 worker。</li>
+            <li>为 <code>http image</code> 提供 local-ready 桥接能力。</li>
+            <li>建立 stable metadata、identity 和 fallback 语义。</li>
+          </ul>
+        </article>
+        <article class="stage">
+          <div class="label"><span class="swatch" style="background:var(--teal-soft)"></span>sidecar</div>
+          <h3>异步增强层</h3>
+          <ul>
+            <li>尽早启动 preprocess 并与主链重叠。</li>
+            <li>提供 CPU NumPy artifact 缓存与统一治理平面。</li>
+            <li>TP Worker 最多短等 2ms，来不及就回 phase4/offload。</li>
+          </ul>
+        </article>
+        <article class="stage">
+          <div class="label"><span class="swatch" style="background:var(--orange-soft)"></span>principle</div>
+          <h3>首版原则</h3>
+          <ul>
+            <li>边界清晰，只支持 <code>local-ready image</code>。</li>
+            <li>结果必须与 <code>stock / phase4 / sidecar</code> 完全一致。</li>
+            <li>收益增强失败时绝不能破坏原有稳定链。</li>
+          </ul>
+        </article>
+      </div>
+    </section>
+
+    <details open>
+      <summary>
+        <div class="summary-left">
+          <span class="summary-index">01</span>
+          <div class="summary-copy">
+            <b>背景与演进：为什么问题不是从 sidecar 才开始</b>
+            <span>先讲清楚原始链路和下沉底座，否则无法准确理解 sidecar 的定位。</span>
+          </div>
+        </div>
+        <span class="chev"></span>
+      </summary>
+      <div class="body">
+        <p class="lede">
+          在原始 <code>stock vLLM</code> 多模态链路中，API Server 不只做请求编排，它还承担了大量图像相关 CPU 热点：
+          图像读取、decode、resize、normalize、HF preprocess、multimodal hash 计算和部分 copy/serialize。
+          问题不是这些工作“本身不该做”，而是它们出现在了 API 侧关键路径上。
+        </p>
+        <div class="split">
+          <div class="ascii-block">
+<pre>Client Request
+  |
+  v
+API Server
+  |-- parse chat messages
+  |-- read image / fetch image
+  |-- decode image
+  |-- resize / normalize
+  |-- HF multimodal preprocess
+  |-- compute multimodal hash
+  |-- serialize / copy
+  v
+EngineCore / Scheduler
+  v
+TP Worker
+  |-- consume already-preprocessed mm inputs
+  v
+ViT / LLM Forward</pre>
+          </div>
+          <div class="card orange">
+            <h3>原始链路的问题画像</h3>
+            <ul>
+              <li>API Server 成为多模态 CPU 热点汇聚点。</li>
+              <li>请求越重，TTFT 越容易直接被 API 侧 preprocess 拉长。</li>
+              <li>preprocess 与推理主链重叠不足，串行热点明显。</li>
+              <li>多并发下，波动直接放大为 tail latency 问题。</li>
+            </ul>
+          </div>
+        </div>
+        <div class="grid-2" style="margin-top:16px;">
+          <article class="card blue">
+            <h3>API Server多模态数据处理下沉已经做对了什么</h3>
+            <p>
+              现有底座不是“又一条候选方案”，而是 ACMP 的前提。它已经把多模态主处理面下沉到 worker，
+              为 <code>http image</code> 提供了 local-ready 桥接能力，并建立了
+              <code>local_path / media_uuid / source_key / request_media_index</code> 这套稳定 metadata 语义。
+            </p>
+          </article>
+          <article class="card teal">
+            <h3>为什么下沉方案还不够</h3>
+            <p>
+              即使热点已从 API 侧移到 worker，worker 侧 preprocess 仍然高度依赖图像尺寸、数量和分布而波动，
+              且 preprocess 启动时机仍偏晚，难以与 tokenizer、prompt build、engine submit 做更强重叠。
+            </p>
+          </article>
+        </div>
+      </div>
+    </details>
+
+    <details open>
+      <summary>
+        <div class="summary-left">
+          <span class="summary-index">02</span>
+          <div class="summary-copy">
+            <b>问题定义：这套方案到底要解决什么问题</b>
+            <span>不是泛泛谈“多模态慢”，而是明确列出系统级问题清单。</span>
+          </div>
+        </div>
+        <span class="chev"></span>
+      </summary>
+      <div class="body">
+        <div class="grid-3">
+          <article class="card orange">
+            <h3>问题一：worker preprocess 波动大</h3>
+            <p>图像尺寸、数量、纵横比与并发分布会直接放大到 ViT 前等待不均和 request tail latency。</p>
+          </article>
+          <article class="card orange">
+            <h3>问题二：preprocess 启动过晚</h3>
+            <p>worker 拿到任务后才开始大规模 preprocess，导致主链与 preprocess 的重叠度仍然有限。</p>
+          </article>
+          <article class="card orange">
+            <h3>问题三：缺少独立治理平面</h3>
+            <p>当前缺少专门面向 CPU preprocess artifact 的统一服务化治理层：队列、缓存、TTL/LRU、容量与路由都没有独立抽象。</p>
+          </article>
+        </div>
+        <div class="grid-2" style="margin-top:16px;">
+          <article class="card teal">
+            <h3>问题四：需要 artifact 级复用</h3>
+            <p>
+              希望缓存的是 <code>pixel_values</code>、<code>image_grid_thw</code>、<code>patch_grid</code> 这类稳定产物，
+              而不是某个请求内临时过程状态。这样多轮对话和跨请求同源图像才能真正受益。
+            </p>
+          </article>
+          <article class="card blue">
+            <h3>问题五：接入必须低风险</h3>
+            <p>
+              sidecar 的收益增强绝不能破坏现有链路。一旦未命中、超时、失败或整体不可用，请求必须快速回到
+              <code>API Server多模态数据处理下沉</code> 底座，必要时再回 <code>stock</code>。
+            </p>
+          </article>
+        </div>
+      </div>
+    </details>
+
+    <details open>
+      <summary>
+        <div class="summary-left">
+          <span class="summary-index">03</span>
+          <div class="summary-copy">
+            <b>方案目标与边界：哪些事情要做，哪些事情暂时不做</b>
+            <span>先把边界钉死，后面的架构与评测才不会发散。</span>
+          </div>
+        </div>
+        <span class="chev"></span>
+      </summary>
+      <div class="body">
+        <div class="grid-3">
+          <article class="card teal">
+            <h3>目标</h3>
+            <ul>
+              <li>在现有下沉方案兼容前提下引入图像异步 preprocess。</li>
+              <li>让 API Server 主链与 preprocess 并行推进。</li>
+              <li>提供 CPU artifact 缓存复用与统一治理。</li>
+              <li>保留 TP / ViT-DP 既有消费语义不变。</li>
+            </ul>
+          </article>
+          <article class="card blue">
+            <h3>MVP 输入边界</h3>
+            <ul>
+              <li>仅支持 <code>local-ready image</code>。</li>
+              <li><code>image + local_path</code> 可直接进入 sidecar。</li>
+              <li><code>image + http</code> 需先经 phase4/offload materialize 为本地文件后再进入。</li>
+            </ul>
+          </article>
+          <article class="card orange">
+            <h3>MVP 明确不做</h3>
+            <ul>
+              <li>不支持 <code>base64 image</code> 进入 sidecar。</li>
+              <li>不支持任何 <code>video</code> 进入 sidecar。</li>
+              <li>不外置 ViT encode，不改写 EngineCore 主调度。</li>
+            </ul>
+          </article>
+        </div>
+        <div class="grid-2" style="margin-top:16px;">
+          <article class="card orange">
+            <h3>混合请求规则</h3>
+            <p>
+              只要请求中包含 <code>base64 image</code> 或任意 <code>video</code>，则整请求 bypass sidecar，
+              直接走 <code>stock</code>。首版不做一请求内媒体级混合拆分，以降低 correctness 与调试风险。
+            </p>
+          </article>
+          <article class="card teal">
+            <h3>为什么边界如此保守</h3>
+            <p>
+              因为首版的关键不是“支持所有输入”，而是先证明
+              <code>local-ready image</code> 场景下，sidecar 可以在不破坏主链 correctness 的前提下带来真实收益。
+            </p>
+          </article>
+        </div>
+      </div>
+    </details>
+
+    <details open>
+      <summary>
+        <div class="summary-left">
+          <span class="summary-index">04</span>
+          <div class="summary-copy">
+            <b>总体架构：底座保底链与异步增强链如何协同</b>
+            <span>这是 ACMP 最核心的结构判断。</span>
+          </div>
+        </div>
+        <span class="chev"></span>
+      </summary>
+      <div class="body">
+        <p class="lede">
+          sidecar 不替代现有下沉方案，而是在现有保底链路之外，增加一个“尽早启动、异步执行、可缓存复用、TP Worker 按需汇合”的平面。
+          只要 sidecar ready，就吃增强收益；来不及时，马上回到底座保底链。
+        </p>
+        <div class="split">
+          <div class="ascii-block">
+<pre>Client Request
+  |
+  v
+API Server
+  |-- parse media / build metadata
+  |-- for http image in current offload plan:
+  |     materialize to local-ready file first
+  |-- emit PREPARE to mm-sidecar as early as possible
+  |-- tokenizer / prompt build / engine submit continue in parallel
+  v
+EngineCore / Scheduler
+  |-- schedule as usual
+  |-- carry lightweight metadata / handle only
+  v
+TP Worker
+  |-- decide local shard ownership
+  |-- GET_STATUS / FETCH_RESULT from mm-sidecar
+  |-- ready -> use sidecar artifact -> ViT encode
+  |-- not ready / timeout / sidecar unavailable
+  |      -> fallback to API Server多模态数据处理下沉链
+  |-- if unsupported there too -> stock
+  v
+LLM Forward / Decode</pre>
+          </div>
+          <div class="card teal">
+            <h3>四条最重要的架构原则</h3>
+            <ul>
+              <li>现有下沉方案是底座，不是 sidecar 的竞争者。</li>
+              <li>sidecar 是增强链，不是阻塞链。</li>
+              <li>metadata 必须保持与现有下沉链路兼容。</li>
+              <li>TP / ViT-DP 的分布式消费语义不能被 sidecar 改写。</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+    </details>
+
+    <details open>
+      <summary>
+        <div class="summary-left">
+          <span class="summary-index">05</span>
+          <div class="summary-copy">
+            <b>端到端时序：请求进入后每一步到底怎么走</b>
+            <span>把时序写清楚，才能讨论 2ms wait budget 是否合理。</span>
+          </div>
+        </div>
+        <span class="chev"></span>
+      </summary>
+      <div class="body">
+        <div class="timeline">
+          <div class="timeline-step">
+            <div class="n">1</div>
+            <div class="content">
+              <b>API Server 解析媒体项并建立基础 identity</b>
+              <p>构建 <code>source_key</code>、<code>media_uuid</code>、<code>request_media_index</code>，并复用现有 <code>mm_hash</code> 语义。</p>
+            </div>
+          </div>
+          <div class="timeline-step">
+            <div class="n">2</div>
+            <div class="content">
+              <b>对 http image 先 materialize 成 local-ready 文件</b>
+              <p>sidecar 的输入契约是 <code>local-ready image</code>，不是原始 http transport。</p>
+            </div>
+          </div>
+          <div class="timeline-step">
+            <div class="n">3</div>
+            <div class="content">
+              <b>API Server 拿到最小 metadata 后立刻发 PREPARE</b>
+              <p>PREPARE 采用 A 方案，绝不延后到更靠近 engine submit 才发。</p>
+            </div>
+          </div>
+          <div class="timeline-step">
+            <div class="n">4</div>
+            <div class="content">
+              <b>API Server 主链继续推进</b>
+              <p>tokenizer / prompt build / engine submit 与 sidecar 后台 preprocess 并行发生。</p>
+            </div>
+          </div>
+          <div class="timeline-step">
+            <div class="n">5</div>
+            <div class="content">
+              <b>sidecar worker 后台执行 preprocess</b>
+              <p>执行 read、decode、resize、HF preprocess，并持有 CPU NumPy artifact。</p>
+            </div>
+          </div>
+          <div class="timeline-step">
+            <div class="n">6</div>
+            <div class="content">
+              <b>TP Worker 到达消费点后查询 sidecar 状态</b>
+              <p>先向 manager 走 <code>GET_STATUS</code>，仅当 ready 时再向 owner worker 发 <code>FETCH_RESULT</code>。</p>
+            </div>
+          </div>
+          <div class="timeline-step">
+            <div class="n">7</div>
+            <div class="content">
+              <b>命中则直取 artifact，未 ready 则快速回退</b>
+              <p>TP Worker 只等 <= <code>2ms</code>；若仍未 ready，就回到底座 phase4/offload 保底链，再必要时回 stock。</p>
+            </div>
+          </div>
+        </div>
+        <div class="card orange" style="margin-top:16px;">
+          <h3>为什么 2ms 不矛盾</h3>
+          <p>
+            2ms 不是为了“现场把冷任务等出来”，而是为了接住 cache hit 或 near-ready 任务。真正让 sidecar 成立的关键不是等待更久，
+            而是 <code>PREPARE</code> 必须足够早地发出，从而让 preprocess 在主链前面提前开跑。
+          </p>
+        </div>
+      </div>
+    </details>
+
+    <details open>
+      <summary>
+        <div class="summary-left">
+          <span class="summary-index">06</span>
+          <div class="summary-copy">
+            <b>Artifact、Metadata 与 Identity：结果到底长什么样</b>
+            <span>sidecar 的核心交付物不是“某个对象”，而是稳定、可比较、可缓存的工件。</span>
+          </div>
+        </div>
+        <span class="chev"></span>
+      </summary>
+      <div class="body">
+        <div class="grid-2">
+          <article class="card teal">
+            <h3>Artifact 格式选择</h3>
+            <ul>
+              <li>对外标准格式固定为 CPU <code>NumPy</code>。</li>
+              <li>不使用 GPU/NPU tensor 作为缓存协议格式。</li>
+              <li>不以 Python pickle 作为主协议。</li>
+            </ul>
+            <p>
+              之所以选 NumPy，是因为它更中性、更适合作为跨进程 artifact 协议格式，也更容易明确约束
+              <code>shape / dtype / layout</code>。
+            </p>
+          </article>
+          <article class="card blue">
+            <h3>Payload 最终目标</h3>
+            <ul>
+              <li><code>pixel_values</code></li>
+              <li><code>image_grid_thw</code></li>
+              <li><code>patch_grid</code></li>
+            </ul>
+            <p>
+              这三者是当前讨论中明确的目标产物，也是后续 correctness 对比的核心对象。
+            </p>
+          </article>
+        </div>
+        <div class="grid-2" style="margin-top:16px;">
+          <div class="card blue">
+            <h3>必须保留的底座兼容字段</h3>
+            <div class="table-like">
+              <div class="row"><div class="k">local_path</div><div class="v">现有下沉链路 fallback 的本地就绪对象语义。sidecar 不可用时，worker 直接利用它回到底座链。</div></div>
+              <div class="row"><div class="k">media_uuid</div><div class="v">请求内稳定媒体身份锚点，利于 trace 与排障，但不进入 cache key。</div></div>
+              <div class="row"><div class="k">source_key</div><div class="v">transport-aware identity，避免 <code>local_path / http / base64</code> 串扰。</div></div>
+              <div class="row"><div class="k">request_media_index</div><div class="v">请求内媒体顺序语义，与 TP / ViT-DP 消费规则保持对齐，但不进入 cache key。</div></div>
+            </div>
+          </div>
+          <div class="card teal">
+            <h3>sidecar 新增增强字段</h3>
+            <div class="table-like">
+              <div class="row"><div class="k">mm_handle</div><div class="v">运行时句柄，用于 <code>GET_STATUS</code> 与 <code>FETCH_RESULT</code>，不等于 cache key。</div></div>
+              <div class="row"><div class="k">mm_schema_version</div><div class="v">artifact 协议版本，用于消费前的格式兼容性校验。</div></div>
+              <div class="row"><div class="k">preprocess_fingerprint</div><div class="v">processor / resize / pad / normalize / patch / dtype / layout 的完整版本签名。</div></div>
+              <div class="row"><div class="k">cache_key</div><div class="v">source-level identity 与 preprocess 版本共同决定的缓存主键。</div></div>
+            </div>
+          </div>
+        </div>
+        <div class="card" style="margin-top:16px;">
+          <h3>Artifact Header 建议字段</h3>
+          <p>
+            <code>schema_version</code>、<code>processor_fingerprint</code>、<code>preprocess_fingerprint</code>、
+            <code>media_type</code>、<code>source_key</code>、<code>media_uuid</code>、
+            <code>original_size</code>、<code>resized_size</code>、<code>dtype</code>、
+            <code>shape</code>、<code>layout</code>、<code>created_at</code>、<code>expire_at</code>。
+          </p>
+        </div>
+      </div>
+    </details>
+
+    <details open>
+      <summary>
+        <div class="summary-left">
+          <span class="summary-index">07</span>
+          <div class="summary-copy">
+            <b>cache key 与复用语义：跨请求怎么复用，为什么不追求最大化去重</b>
+            <span>这部分决定了 sidecar 缓存的边界是否稳定。</span>
+          </div>
+        </div>
+        <span class="chev"></span>
+      </summary>
+      <div class="body">
+        <div class="split">
+          <div class="ascii-block">
+<pre>cache_key = sha256(
+    media_type
+  + source_key
+  + file_size
+  + mtime_ns
+  + preprocess_fingerprint
+)</pre>
+          </div>
+          <div class="card teal">
+            <h3>这个公式表达的设计判断</h3>
+            <ul>
+              <li>复用语义是 source-level reuse，而不是内容级最大化 dedup。</li>
+              <li><code>file_size + mtime_ns</code> 用于避免路径不变但文件已变化的误复用。</li>
+              <li><code>preprocess_fingerprint</code> 用于隔离版本与配置漂移。</li>
+            </ul>
+          </div>
+        </div>
+        <div class="grid-3" style="margin-top:16px;">
+          <article class="card blue">
+            <h3>为什么不放入 media_uuid</h3>
+            <p><code>media_uuid</code> 更适合做请求内与 trace 身份锚点，放入 cache key 会破坏跨请求同源复用。</p>
+          </article>
+          <article class="card blue">
+            <h3>为什么不放入 request_media_index</h3>
+            <p><code>request_media_index</code> 是请求内顺序字段，放入 cache key 会让同一图像在不同请求顺序下无法复用。</p>
+          </article>
+          <article class="card orange">
+            <h3>复用能力的准确表述</h3>
+            <p>sidecar 可以跨请求复用，但更准确地说是“同源引用级复用”，不是“同内容最大化复用”。对 MVP 来说这已经足够。</p>
+          </article>
+        </div>
+      </div>
+    </details>
+
+    <details open>
+      <summary>
+        <div class="summary-left">
+          <span class="summary-index">08</span>
+          <div class="summary-copy">
+            <b>并发执行模型：多进程 sidecar 内部应该怎么跑</b>
+            <span>单并发只看链路，多并发才真正暴露方案优劣。</span>
+          </div>
+        </div>
+        <span class="chev"></span>
+      </summary>
+      <div class="body">
+        <div class="split">
+          <div class="ascii-block">
+<pre>mm-sidecar manager
+  |- task registry
+  |- cache metadata
+  |- TTL / LRU / eviction
+  |- owner routing
+  |
+  +-- worker-0 (compute + payload shard + ZMQ endpoint)
+  +-- worker-1 (compute + payload shard + ZMQ endpoint)
+  +-- worker-2 (compute + payload shard + ZMQ endpoint)
+  +-- ...
+  +-- worker-N (compute + payload shard + ZMQ endpoint)</pre>
+          </div>
+          <div class="card teal">
+            <h3>最终并发模型</h3>
+            <ul>
+              <li>sidecar 采用固定多进程 worker pool，例如 32 进程占用 32 核。</li>
+              <li>每个进程独立完成读图、decode、resize、HF preprocess、payload 持有与缓存写入。</li>
+              <li>manager 只维护 metadata、状态、TTL/LRU、capacity 与 owner routing。</li>
+              <li>payload 不回灌到 manager，直接由 owner worker 返回给 TP Worker。</li>
+            </ul>
+          </div>
+        </div>
+        <div class="grid-3" style="margin-top:16px;">
+          <article class="card blue">
+            <h3>为什么允许重复算</h3>
+            <p>MVP 不做严格 inflight 去重。不同 worker 重复算同一媒体项是可接受的，但写缓存时若别的进程已发布成功，后来的结果不再重复发布。</p>
+          </article>
+          <article class="card blue">
+            <h3>为什么不是 manager 持 payload</h3>
+            <p>如果 manager 同时承担 metadata、payload 写入和 payload 返回，会非常容易变成新的热点瓶颈。</p>
+          </article>
+          <article class="card orange">
+            <h3>为什么不做更复杂调度</h3>
+            <p>像 <code>small-first</code>、等待态优先级提升、复杂 inflight dedup 都会显著增加复杂度，但并不是首版的关键收益来源。</p>
+          </article>
+        </div>
+      </div>
+    </details>
+
+    <details open>
+      <summary>
+        <div class="summary-left">
+          <span class="summary-index">09</span>
+          <div class="summary-copy">
+            <b>传输协议：为什么不用 shm，为什么选 ZMQ + msgpack</b>
+            <span>协议与内存模型决定了 sidecar 的实现复杂度和可靠性上限。</span>
+          </div>
+        </div>
+        <span class="chev"></span>
+      </summary>
+      <div class="body">
+        <div class="grid-3">
+          <article class="card orange">
+            <h3>为什么不走 shm payload</h3>
+            <p>共享内存的主动驱逐、生命周期与容量治理复杂度很高，迟早会遇到“空间被挤爆”和残留对象问题，不适合做 MVP 主路径。</p>
+          </article>
+          <article class="card teal">
+            <h3>为什么选 ZMQ</h3>
+            <p>vLLM 现有通信风格就有 ZMQ / msgpack 基础，sidecar 复用这一风格能降低接入和调试成本。</p>
+          </article>
+          <article class="card blue">
+            <h3>为什么是 REQ/REP</h3>
+            <p>MVP 只需要支撑 <code>PREPARE</code>、<code>GET_STATUS</code>、<code>FETCH_RESULT</code> 三类同步请求，REQ/REP 语义清晰且足够简单。</p>
+          </article>
+        </div>
+        <div class="grid-2" style="margin-top:16px;">
+          <article class="card blue">
+            <h3>最终协议风格</h3>
+            <p>
+              本地通信使用独立 <code>ZMQ ipc://</code>。结构化 header 采用 <code>msgpack</code>，
+              大 payload 采用 raw binary frames。
+            </p>
+          </article>
+          <article class="card teal">
+            <h3>路由方式</h3>
+            <p>
+              TP Worker 先向 manager 查状态与 owner，再直连 owner worker 拉取 payload。
+              manager 不直接承担大数据出数。
+            </p>
+          </article>
+        </div>
+      </div>
+    </details>
+
+    <details open>
+      <summary>
+        <div class="summary-left">
+          <span class="summary-index">10</span>
+          <div class="summary-copy">
+            <b>等待、fallback 与失败处理：TP Worker 早到怎么办</b>
+            <span>这是 sidecar 成败最关键的极端场景。</span>
+          </div>
+        </div>
+        <span class="chev"></span>
+      </summary>
+      <div class="body">
+        <div class="split">
+          <div class="ascii-block">
+<pre>API Server gets minimal metadata
+  |
+  +-- emit PREPARE immediately
+  |
+  +-- tokenizer / engine submit continue in parallel
+
+TP Worker receives mm_handle
+  |
+  +-- ready   -> consume sidecar result
+  |
+  +-- queued / running
+  |      |
+  |      +-- wait &lt;= 2ms budget
+  |             |
+  |             +-- becomes ready -> consume
+  |             +-- still not ready -> fallback phase4 / current offload path
+  |
+  +-- failed / expired / not_found -> fallback phase4 / current offload path
+                           |
+                           +-- if unsupported there too -> stock</pre>
+          </div>
+          <div class="card orange">
+            <h3>明确结论</h3>
+            <ul>
+              <li><code>PREPARE</code> 必须在 API Server 拿到最小 metadata 后立即发出。</li>
+              <li>TP Worker 总等待预算默认 <code>2ms</code>，并通过环境变量可配置。</li>
+              <li>2ms 的意义是接住 cache hit 或 near-ready 任务，而不是等待冷任务完成。</li>
+              <li>fallback 后 sidecar 任务继续跑，完成后仍可写入缓存，为后续请求复用。</li>
+            </ul>
+          </div>
+        </div>
+        <div class="grid-2" style="margin-top:16px;">
+          <article class="card teal">
+            <h3>fallback 到哪一层</h3>
+            <p>默认先 fallback 到 <code>API Server多模态数据处理下沉</code> 底座，再必要时回 <code>stock</code>。这正是 sidecar 低风险接入的关键。</p>
+          </article>
+          <article class="card blue">
+            <h3>为什么不取消 sidecar 任务</h3>
+            <p>取消逻辑收益有限、复杂度高，而缓存住结果后，多轮对话和后续同源请求仍可能命中并摊平本次预处理代价。</p>
+          </article>
+        </div>
+      </div>
+    </details>
+
+    <details open>
+      <summary>
+        <div class="summary-left">
+          <span class="summary-index">11</span>
+          <div class="summary-copy">
+            <b>缓存与生命周期：CPU artifact 池如何长期稳定工作</b>
+            <span>sidecar 的价值不只是“异步”，还包括“结果变成可治理资产”。</span>
+          </div>
+        </div>
+        <span class="chev"></span>
+      </summary>
+      <div class="body">
+        <div class="grid-3">
+          <article class="card blue">
+            <h3>缓存准入规则</h3>
+            <p>所有完成 artifact 都尝试进入缓存，不按文件大小做准入歧视。首版行为越简单，越利于解释、排障与回归。</p>
+          </article>
+          <article class="card teal">
+            <h3>逐出策略</h3>
+            <p>统一采用 <code>TTL + LRU</code>。TTL 提供时间边界，LRU 提供空间压力下的热度淘汰能力。</p>
+          </article>
+          <article class="card orange">
+            <h3>为什么不做跨重启复用</h3>
+            <p>cache 是内存态，sidecar 重启后变冷可接受。MVP 不为了持久化 cache 引入更复杂的一致性与版本问题。</p>
+          </article>
+        </div>
+        <div class="grid-2" style="margin-top:16px;">
+          <article class="card blue">
+            <h3>总预算与 worker budget</h3>
+            <p>
+              统一配置例如 <code>MM_SIDECAR_CACHE_GB=20</code>、<code>MM_SIDECAR_WORKERS=32</code>。
+              MVP 默认均分到每个 worker：<code>per_worker_budget = total / worker_count</code>。
+            </p>
+          </article>
+          <article class="card teal">
+            <h3>manager 需要看到的压力信息</h3>
+            <p>
+              每个 worker 至少上报 <code>cache_bytes_used</code>、<code>artifact_count</code>、
+              <code>inflight_bytes</code> 与 <code>pressure_state</code>，这样 eviction 决策才不会脱离真实压力。
+            </p>
+          </article>
+        </div>
+        <div class="grid-3" style="margin-top:16px;">
+          <article class="card">
+            <h3>删除中的借用保护</h3>
+            <p>若 entry 正在被 <code>FETCH_RESULT</code> 读取，则 owner worker 标记为 <code>borrowed</code>，删除改为 <code>pending_delete</code>。</p>
+          </article>
+          <article class="card">
+            <h3>fetch 结束后再删</h3>
+            <p>读取完成后立即删除并回传 <code>delete-ack</code>，避免 payload 返回过程中对象被删掉。</p>
+          </article>
+          <article class="card">
+            <h3>为什么不做全局 pin/unpin</h3>
+            <p>复杂全局引用计数不是首版收益重点，而 borrowed / pending_delete 已足够覆盖 fetch 中途删除这一关键风险。</p>
+          </article>
+        </div>
+      </div>
+    </details>
+
+    <details open>
+      <summary>
+        <div class="summary-left">
+          <span class="summary-index">12</span>
+          <div class="summary-copy">
+            <b>Prefix Caching、版本治理与 TP/ViT-DP 对齐</b>
+            <span>这部分决定 sidecar 是否真正能在现有系统里低风险落地。</span>
+          </div>
+        </div>
+        <span class="chev"></span>
+      </summary>
+      <div class="body">
+        <div class="grid-2">
+          <article class="card orange">
+            <h3>Prefix Caching 的核心原则</h3>
+            <p>
+              sidecar 不重新发明多模态 hash。对于 <code>extra_keys</code> 依赖的多模态 hash，优先复用现有
+              <code>API Server多模态数据处理下沉 / API Server</code> 侧逻辑。
+            </p>
+          </article>
+          <article class="card blue">
+            <h3>为什么仍然需要 preprocess_fingerprint</h3>
+            <p>
+              sidecar 缓存的不只是“这个输入是谁”，还包括“在某个 preprocess 版本和配置下产出的工件是什么”。
+              因此必须显式维护自己的 <code>preprocess_fingerprint</code>。
+            </p>
+          </article>
+        </div>
+        <div class="grid-3" style="margin-top:16px;">
+          <article class="card teal">
+            <h3>版本漂移如何隔离</h3>
+            <p>将 <code>schema_version</code>、processor 版本、resize/pad/interpolation、normalize、patch size、dtype、layout 全部纳入 fingerprint。header 不匹配即视为 miss。</p>
+          </article>
+          <article class="card teal">
+            <h3>TP / ViT-DP 不被 sidecar 改写</h3>
+            <p>sidecar 只输出全局稳定 preprocess 工件，不预先按 rank 切结果。TP Worker 仍按既有规则决定本 rank 消费哪些媒体项。</p>
+          </article>
+          <article class="card blue">
+            <h3>为什么这样最稳</h3>
+            <p>它让 sidecar 与分布式执行语义尽可能解耦，避免首版把 cache、route 与 rank 语义绑死在一起。</p>
+          </article>
+        </div>
+      </div>
+    </details>
+
+    <details open>
+      <summary>
+        <div class="summary-left">
+          <span class="summary-index">13</span>
+          <div class="summary-copy">
+            <b>可用性、监管与失败窗口：sidecar 挂了怎么办</b>
+            <span>既然 sidecar 是增强层，它就必须具备“随时失效但不拖垮主链”的能力。</span>
+          </div>
+        </div>
+        <span class="chev"></span>
+      </summary>
+      <div class="body">
+        <div class="grid-3">
+          <article class="card orange">
+            <h3>sidecar 不可用时的行为</h3>
+            <p><code>PREPARE</code> 失败不阻塞 API Server 主链；<code>GET_STATUS</code> 或 <code>FETCH_RESULT</code> 失败则 TP Worker 快速 fallback 到 phase4/offload 底座。</p>
+          </article>
+          <article class="card teal">
+            <h3>短时失败窗口</h3>
+            <p>API Server 与 TP Worker 都应实现轻量 breaker。建议环境变量：<code>MM_SIDECAR_FAILURE_BACKOFF_MS=500</code>。</p>
+          </article>
+          <article class="card blue">
+            <h3>外部监管方式</h3>
+            <p>MVP 由 <code>systemd</code> 直接监管 mm-sidecar，负责自动拉起、异常重启、重启间隔和旧 IPC socket 清理。</p>
+          </article>
+        </div>
+        <div class="card" style="margin-top:16px;">
+          <h3>为什么不在请求链里拉起 sidecar</h3>
+          <p>
+            请求链的职责是服务请求，不是做进程编排。把进程拉起与恢复逻辑放进主链，只会让 sidecar 从“增强层”变成“额外不稳定源”。
+            用 <code>systemd</code> 外部监管，职责最清晰、故障边界也最明确。
+          </p>
+        </div>
+      </div>
+    </details>
+
+    <details open>
+      <summary>
+        <div class="summary-left">
+          <span class="summary-index">14</span>
+          <div class="summary-copy">
+            <b>正确性验证：stock / phase4 / sidecar 必须完全一致</b>
+            <span>在 ACMP 里，correctness 不是附属任务，而是所有收益成立的前提。</span>
+          </div>
+        </div>
+        <span class="chev"></span>
+      </summary>
+      <div class="body">
+        <div class="grid-3">
+          <article class="card blue">
+            <h3>artifact exact compare</h3>
+            <p>必须比较 <code>stock</code>、<code>API Server多模态数据处理下沉</code>、<code>mm-sidecar</code> 三条链的 <code>pixel_values</code>、<code>image_grid_thw</code>、<code>patch_grid</code>、dtype、shape、layout。</p>
+          </article>
+          <article class="card teal">
+            <h3>ViT output exact compare</h3>
+            <p>三条链进入 ViT 后的输出 tensor 必须逐项一致，不接受 near-exact、allclose 或“数值差不多”。</p>
+          </article>
+          <article class="card orange">
+            <h3>end-to-end fixed-case exact compare</h3>
+            <p>固定输入、固定 prompt、固定推理配置后，最终输出必须 exact match。任何不一致都视为 correctness failure。</p>
+          </article>
+        </div>
+        <div class="grid-2" style="margin-top:16px;">
+          <article class="card orange">
+            <h3>为什么一定要 exact</h3>
+            <p>
+              sidecar 是线上主链增强，不是研究 demo。只要 preprocess 产物或 ViT 输出有轻微漂移，就会进一步影响 prefix caching、
+              encoder cache、排障与回归判断，因此必须坚持 exact compare。
+            </p>
+          </article>
+          <article class="card teal">
+            <h3>测试顺序建议</h3>
+            <p>
+              先在 <code>local-ready image</code> 场景做 artifact / ViT / end-to-end 三层对比，
+              先把 correctness 证清楚，再讨论性能收益和更宽输入边界。
+            </p>
+          </article>
+        </div>
+      </div>
+    </details>
+
+    <details open>
+      <summary>
+        <div class="summary-left">
+          <span class="summary-index">15</span>
+          <div class="summary-copy">
+            <b>性能收益分析：收益来自哪里，不来自哪里</b>
+            <span>只有把收益来源讲清楚，后续评测指标才不会选错。</span>
+          </div>
+        </div>
+        <span class="chev"></span>
+      </summary>
+      <div class="body">
+        <div class="grid-2">
+          <article class="card teal">
+            <h3>可行性结论</h3>
+            <p>
+              该方案具备可行性，因为它建立在已有下沉底座之上，不需要推倒现有链路；它的增强点明确，fallback 语义清晰，
+              风险边界也容易控制。
+            </p>
+          </article>
+          <article class="card blue">
+            <h3>收益主来源</h3>
+            <p>
+              收益来自更早启动 preprocess、更强的主链与 preprocess 重叠、更统一的 CPU artifact 治理与复用，
+              以及多并发下更可控的 preprocess 平面。
+            </p>
+          </article>
+        </div>
+        <div class="grid-3" style="margin-top:16px;">
+          <article class="card blue">
+            <h3>收益点一：PREPARE 提前发出</h3>
+            <p>API Server 在 tokenizer / prompt build / engine submit 继续进行时就发 PREPARE，为 worker 抢出并行时间。</p>
+          </article>
+          <article class="card blue">
+            <h3>收益点二：artifact 级复用</h3>
+            <p>多轮对话与跨请求同源图像可以直接复用 <code>pixel_values / image_grid_thw / patch_grid</code>，而无需重复 preprocess。</p>
+          </article>
+          <article class="card blue">
+            <h3>收益点三：独立治理平面</h3>
+            <p>队列、cache、TTL/LRU、capacity、owner routing 被统一服务化治理，调优与观测都更清晰。</p>
+          </article>
+        </div>
+        <div class="grid-2" style="margin-top:16px;">
+          <article class="card orange">
+            <h3>收益不来自哪里</h3>
+            <p>
+              不是因为 sidecar 改写了 EngineCore 调度器，不是因为外置了 ViT encode，也不是因为让 worker 长时间等待；
+              它的本质收益来自“同样正确的 preprocess 被更早启动，并被做成可复用的 artifact”。
+            </p>
+          </article>
+          <article class="card orange">
+            <h3>什么时候收益可能不明显</h3>
+            <p>
+              极轻图像、低复用率、sidecar 命中率低且频繁 fallback 的场景中，收益可能不显著。因此评测必须同时看命中率、
+              near-ready 比例、fallback 比例和 cache 复用率。
+            </p>
+          </article>
+        </div>
+      </div>
+    </details>
+
+    <details open>
+      <summary>
+        <div class="summary-left">
+          <span class="summary-index">16</span>
+          <div class="summary-copy">
+            <b>观测、评测、MVP 和后续演进</b>
+            <span>最后把上线前需要准备的工程面收束起来。</span>
+          </div>
+        </div>
+        <span class="chev"></span>
+      </summary>
+      <div class="body">
+        <div class="grid-3">
+          <article class="card teal">
+            <h3>观测分级</h3>
+            <p>使用环境变量 <code>MM_SIDECAR_OBS_LEVEL=P0|P1|P2</code>。<code>P0</code> 最小健康信号，<code>P1</code> 默认摘要级，<code>P2</code> 深度诊断。</p>
+          </article>
+          <article class="card blue">
+            <h3>首版评测建议</h3>
+            <p>先聚焦图像场景，先测 <code>local-ready / local_path</code>，先比较 <code>stock / phase4 / sidecar</code> 的 artifact、ViT 和 end-to-end exact match，再比较时延。</p>
+          </article>
+          <article class="card orange">
+            <h3>先不测什么</h3>
+            <p>首版不要先把精力投入到 <code>http</code> 全链压测、<code>video</code> 和 <code>base64</code>，这些应该放到边界扩展阶段。</p>
+          </article>
+        </div>
+        <div class="grid-2" style="margin-top:16px;">
+          <article class="card blue">
+            <h3>MVP 明确范围</h3>
+            <p>
+              本机 <code>mm-sidecar</code> service、<code>local-ready image</code>、CPU <code>NumPy + metadata</code> artifact、
+              <code>ZMQ ipc:// + REQ/REP + msgpack + binary frames</code>、<code>TTL + LRU</code>、<code>systemd</code> 监管、
+              以及严格 exact-match correctness。
+            </p>
+          </article>
+          <article class="card teal">
+            <h3>后续再讨论的方向</h3>
+            <p>
+              包括 <code>base64 image</code>、<code>video</code>、更强 inflight dedup、跨机 sidecar、动态 budget 和更复杂调度增强。
+              这些都必须建立在图像 sidecar 主路径已稳定、收益已量化的前提之上。
+            </p>
+          </article>
+        </div>
+        <div class="pill-row">
+          <span class="pill">api offload is the base</span>
+          <span class="pill">sidecar is additive</span>
+          <span class="pill">only local-ready image in MVP</span>
+          <span class="pill">reuse api-server mm hash for extra_keys</span>
+          <span class="pill">2ms wait budget</span>
+          <span class="pill">TTL + LRU</span>
+          <span class="pill">ZMQ ipc + msgpack</span>
+          <span class="pill">stock / phase4 / sidecar exact-match</span>
+        </div>
+      </div>
+    </details>
+
+    <section class="footer">
+      当前页面与
+      <a href="/home/light/mm-sidecar/docs/concurrency_design.md">/home/light/mm-sidecar/docs/concurrency_design.md</a>
+      保持同一套 ACMP / mm-sidecar MVP 结论：以 <code>API Server多模态数据处理下沉</code> 作为稳定底座，以
+      <code>mm-sidecar</code> 作为异步协同预处理增强层，在保证 exact-match correctness 的前提下，获得更早的 preprocess 启动时机、
+      更强的多并发治理能力和 artifact 级 CPU 缓存复用能力。
+    </section>
+  </main>
+</body>
+</html>
