@@ -45,12 +45,42 @@ def _available_cpu_ids() -> tuple[int, ...]:
     return tuple(range(cpu_count))
 
 
+def _parse_cpu_set(raw: str | None) -> tuple[int, ...] | None:
+    if not raw:
+        return None
+    cpu_ids: list[int] = []
+    for part in raw.split(","):
+        token = part.strip()
+        if not token:
+            continue
+        if "-" in token:
+            start_raw, end_raw = token.split("-", 1)
+            try:
+                start = int(start_raw)
+                end = int(end_raw)
+            except ValueError:
+                continue
+            if end < start:
+                start, end = end, start
+            cpu_ids.extend(range(start, end + 1))
+            continue
+        try:
+            cpu_ids.append(int(token))
+        except ValueError:
+            continue
+    unique_ids = tuple(sorted(set(cpu_ids)))
+    return unique_ids or None
+
+
 def _default_worker_count() -> int:
     return max(1, min(32, len(_available_cpu_ids())))
 
 
-def _default_cpu_affinity_map(worker_count: int) -> tuple[tuple[int, ...], ...]:
-    cpu_ids = _available_cpu_ids()
+def _default_cpu_affinity_map(
+    worker_count: int,
+    cpu_ids: tuple[int, ...] | None = None,
+) -> tuple[tuple[int, ...], ...]:
+    cpu_ids = cpu_ids or _available_cpu_ids()
     return tuple((cpu_ids[index % len(cpu_ids)],) for index in range(worker_count))
 
 
@@ -70,14 +100,28 @@ def _manager_config_from_env(start_method: str) -> SidecarManagerConfig:
             base_config.cache.reusable_entry_ttl_s,
         ),
     )
+    worker_cpu_ids = _parse_cpu_set(os.getenv("MM_SIDECAR_WORKER_CPU_SET"))
+    if worker_cpu_ids is not None:
+        cpu_affinity_map = _default_cpu_affinity_map(worker_count, worker_cpu_ids)
+    else:
+        cpu_affinity_map = _default_cpu_affinity_map(worker_count)
     return SidecarManagerConfig(
         cache=cache_config,
         workers=WorkerPoolConfig(
             worker_count=worker_count,
-            cpu_affinity_map=_default_cpu_affinity_map(worker_count),
+            cpu_affinity_map=cpu_affinity_map,
             start_method=start_method,
         ),
     )
+
+
+def _bind_current_process_cpu(cpu_ids: tuple[int, ...] | None) -> None:
+    if not cpu_ids or not hasattr(os, "sched_setaffinity"):
+        return
+    try:
+        os.sched_setaffinity(0, set(cpu_ids))
+    except OSError:
+        return
 
 
 def _build_worker_pool(config: SidecarManagerConfig, mode: str):
@@ -145,6 +189,7 @@ def _serve_forever(
     ready_queue: Any,
     manager_config: SidecarManagerConfig,
     worker_pool_mode: str,
+    control_cpu_affinity: tuple[int, ...] | None,
 ) -> None:
     manager = SidecarManager(
         config=manager_config,
@@ -168,6 +213,10 @@ def _serve_forever(
                 )
                 bound_family = candidate_family
                 bound_address = listener.address
+                # Keep startup behavior close to the earlier validated runs:
+                # build the worker pool and listener first, then narrow the
+                # control-plane affinity for the long-running manager loop.
+                _bind_current_process_cpu(control_cpu_affinity)
                 ready_queue.put(
                     {
                         "ok": True,
@@ -236,6 +285,7 @@ class SidecarServiceConfig:
     manager: SidecarManagerConfig = SidecarManagerConfig()
     worker_pool_mode: str = "process"
     start_method: str = "fork"
+    control_cpu_affinity: tuple[int, ...] | None = None
 
 
 class SidecarClient:
@@ -342,6 +392,7 @@ class SidecarServiceProcess:
                 self._ready_queue,
                 self.config.manager,
                 self.config.worker_pool_mode,
+                self.config.control_cpu_affinity,
             ),
         )
         self._started = False
@@ -413,6 +464,7 @@ def sidecar_service_config_from_env(
         os.getenv("MM_SIDECAR_WORKER_START_METHOD", "fork").strip().lower() or "fork"
     )
     manager_config = _manager_config_from_env(start_method)
+    control_cpu_affinity = _parse_cpu_set(os.getenv("MM_SIDECAR_CONTROL_CPU_SET"))
     resolved_transport = transport
     if resolved_transport == "auto":
         if socket_path:
@@ -442,6 +494,7 @@ def sidecar_service_config_from_env(
         manager=manager_config,
         worker_pool_mode=worker_pool_mode,
         start_method=start_method,
+        control_cpu_affinity=control_cpu_affinity,
     )
 
 
@@ -477,6 +530,7 @@ def describe_sidecar_service_config(
         "cpu_affinity_map": [
             list(cpu_ids) for cpu_ids in config.manager.workers.cpu_affinity_map or ()
         ],
+        "control_cpu_affinity": list(config.control_cpu_affinity or ()),
         "reusable_cache_bytes": config.manager.cache.max_reusable_bytes,
         "reusable_ttl_s": config.manager.cache.reusable_entry_ttl_s,
     }

@@ -69,6 +69,8 @@ class SidecarServiceConfigTests(unittest.TestCase):
             "MM_SIDECAR_SOCKET_PATH",
             "MM_SIDECAR_TCP_PORT",
             "MM_SIDECAR_WORKER_COUNT",
+            "MM_SIDECAR_WORKER_CPU_SET",
+            "MM_SIDECAR_CONTROL_CPU_SET",
             "MM_SIDECAR_REUSABLE_CACHE_BYTES",
             "MM_SIDECAR_REUSABLE_TTL_S",
             "MM_SIDECAR_WORKER_START_METHOD",
@@ -78,6 +80,8 @@ class SidecarServiceConfigTests(unittest.TestCase):
             os.environ["MM_SIDECAR_TRANSPORT"] = "unix"
             os.environ["MM_SIDECAR_SOCKET_PATH"] = "/tmp/mm-sidecar-test.sock"
             os.environ["MM_SIDECAR_WORKER_COUNT"] = "3"
+            os.environ["MM_SIDECAR_WORKER_CPU_SET"] = "0-2"
+            os.environ["MM_SIDECAR_CONTROL_CPU_SET"] = "32-47"
             os.environ["MM_SIDECAR_REUSABLE_CACHE_BYTES"] = "123456"
             os.environ["MM_SIDECAR_REUSABLE_TTL_S"] = "42.5"
             os.environ["MM_SIDECAR_WORKER_START_METHOD"] = "fork"
@@ -86,13 +90,18 @@ class SidecarServiceConfigTests(unittest.TestCase):
             self.assertIsNotNone(config)
             assert config is not None
             self.assertEqual(config.manager.workers.worker_count, 3)
-            self.assertEqual(len(config.manager.workers.cpu_affinity_map or ()), 3)
+            self.assertEqual(
+                config.manager.workers.cpu_affinity_map,
+                ((0,), (1,), (2,)),
+            )
+            self.assertEqual(config.control_cpu_affinity, tuple(range(32, 48)))
             self.assertEqual(config.manager.cache.max_reusable_bytes, 123456)
             self.assertEqual(config.manager.cache.reusable_entry_ttl_s, 42.5)
 
             payload = describe_sidecar_service_config(config)
             self.assertEqual(payload["worker_count"], 3)
             self.assertEqual(len(payload["cpu_affinity_map"]), 3)
+            self.assertEqual(payload["control_cpu_affinity"], list(range(32, 48)))
             self.assertEqual(payload["reusable_cache_bytes"], 123456)
             self.assertEqual(payload["reusable_ttl_s"], 42.5)
         finally:

@@ -5,6 +5,7 @@ import math
 import multiprocessing as mp
 import os
 import queue
+import threading
 import time
 import traceback
 import urllib.request
@@ -61,6 +62,9 @@ class ProcessorWorkerPool(Protocol):
         ...
 
     def poll(self, max_items: int | None = None) -> list[WorkerResult]:
+        ...
+
+    def poll_ready(self, max_items: int | None = None) -> list[WorkerResult]:
         ...
 
     def close(self) -> None:
@@ -346,9 +350,9 @@ def _build_image_tensor_payload(
     return descriptor_artifact, payload
 
 
-def _run_task(
+def _load_and_probe_task(
     task: WorkerTask,
-) -> tuple[ImageScheduleItem, ArtifactDescriptor, ImageTensorPayload, dict[str, float]]:
+) -> tuple[Image.Image, ImageScheduleItem, _ImageProcessingPlan, float, float, dict[str, float]]:
     started_at = time.perf_counter()
     after_source_started = time.perf_counter()
     encoded_bytes = _load_encoded_bytes(task.descriptor)
@@ -361,17 +365,55 @@ def _run_task(
     plan = _build_image_processing_plan(image, task.descriptor)
     schedule_item = _build_schedule_item(task.descriptor, plan)
     after_probe = time.perf_counter()
-    descriptor, payload = _build_image_tensor_payload(image, task.descriptor, plan)
-    after_preprocess = time.perf_counter()
 
     timings_ms = {
         "source": (after_source - after_source_started) * 1000.0,
         "decode": (after_decode - after_source) * 1000.0,
         "probe": (after_probe - after_decode) * 1000.0,
+        "probe_ready_since_worker_start": (after_probe - started_at) * 1000.0,
+    }
+    return image, schedule_item, plan, started_at, after_probe, timings_ms
+
+
+def _complete_payload_task(
+    task: WorkerTask,
+    image: Image.Image,
+    plan: _ImageProcessingPlan,
+    *,
+    started_at: float,
+    after_probe: float,
+    timings_ms: dict[str, float],
+) -> tuple[ArtifactDescriptor, ImageTensorPayload, dict[str, float]]:
+    descriptor, payload = _build_image_tensor_payload(image, task.descriptor, plan)
+    after_preprocess = time.perf_counter()
+    completed_timings_ms = {
+        **timings_ms,
         "preprocess": (after_preprocess - after_probe) * 1000.0,
         "total": (after_preprocess - started_at) * 1000.0,
     }
-    return schedule_item, descriptor, payload, timings_ms
+    return descriptor, payload, completed_timings_ms
+
+
+def _run_task(
+    task: WorkerTask,
+) -> tuple[ImageScheduleItem, ArtifactDescriptor, ImageTensorPayload, dict[str, float]]:
+    (
+        image,
+        schedule_item,
+        plan,
+        started_at,
+        after_probe,
+        timings_ms,
+    ) = _load_and_probe_task(task)
+    descriptor, payload, completed_timings_ms = _complete_payload_task(
+        task,
+        image,
+        plan,
+        started_at=started_at,
+        after_probe=after_probe,
+        timings_ms=timings_ms,
+    )
+    return schedule_item, descriptor, payload, completed_timings_ms
 
 
 def run_descriptor_locally(
@@ -403,6 +445,7 @@ def run_descriptor_locally(
 def _worker_main(
     task_queue: "mp.queues.Queue[WorkerTask | None]",
     result_queue: "mp.queues.Queue[WorkerResult]",
+    ready_result_queue: "mp.queues.Queue[WorkerResult] | None",
     worker_id: int,
     cpu_affinity: tuple[int, ...] | None,
 ) -> None:
@@ -411,17 +454,28 @@ def _worker_main(
         task = task_queue.get()
         if task is None:
             return
+        worker_started_put_at_ms = _now_ms()
         result_queue.put(
             WorkerResult(
                 cache_key=task.cache_key,
                 epoch=task.epoch,
                 worker_id=worker_id,
                 event_type="started",
-                at_ms=_now_ms(),
+                at_ms=worker_started_put_at_ms,
+                timings_ms={
+                    "worker_started_put_at_ms": worker_started_put_at_ms,
+                },
             )
         )
         try:
-            schedule_item, descriptor, payload, timings_ms = _run_task(task)
+            (
+                image,
+                schedule_item,
+                plan,
+                started_at,
+                after_probe,
+                timings_ms,
+            ) = _load_and_probe_task(task)
         except Exception as exc:
             result_queue.put(
                 WorkerResult(
@@ -437,22 +491,56 @@ def _worker_main(
                 )
             )
             continue
+        worker_probed_put_at_ms = _now_ms()
         result_queue.put(
             WorkerResult(
                 cache_key=task.cache_key,
                 epoch=task.epoch,
                 worker_id=worker_id,
                 event_type="probed",
-                at_ms=_now_ms(),
+                at_ms=worker_probed_put_at_ms,
                 schedule_item=schedule_item,
                 timings_ms={
                     "source": timings_ms["source"],
                     "decode": timings_ms["decode"],
                     "probe": timings_ms["probe"],
+                    "probe_ready_since_worker_start": timings_ms["probe_ready_since_worker_start"],
+                    "worker_started_put_at_ms": worker_started_put_at_ms,
+                    "worker_probed_put_at_ms": worker_probed_put_at_ms,
+                    "worker_start_to_probed_put_ms": (
+                        worker_probed_put_at_ms - worker_started_put_at_ms
+                    ),
                 },
             )
         )
-        result_queue.put(
+        try:
+            descriptor, payload, completed_timings_ms = _complete_payload_task(
+                task,
+                image,
+                plan,
+                started_at=started_at,
+                after_probe=after_probe,
+                timings_ms=timings_ms,
+            )
+        except Exception as exc:
+            result_queue.put(
+                WorkerResult(
+                    cache_key=task.cache_key,
+                    epoch=task.epoch,
+                    worker_id=worker_id,
+                    event_type="failed",
+                    at_ms=_now_ms(),
+                    schedule_item=schedule_item,
+                    timings_ms=timings_ms,
+                    error_message=(
+                        f"{exc.__class__.__name__}: {exc}\n"
+                        f"{traceback.format_exc(limit=5)}"
+                    ),
+                )
+            )
+            continue
+        target_queue = ready_result_queue or result_queue
+        target_queue.put(
             WorkerResult(
                 cache_key=task.cache_key,
                 epoch=task.epoch,
@@ -462,7 +550,7 @@ def _worker_main(
                 schedule_item=schedule_item,
                 descriptor=descriptor,
                 payload=payload,
-                timings_ms=timings_ms,
+                timings_ms=completed_timings_ms,
             )
         )
 
@@ -485,7 +573,14 @@ class InlineProcessorWorkerPool:
             )
         )
         try:
-            schedule_item, descriptor, payload, timings_ms = _run_task(task)
+            (
+                image,
+                schedule_item,
+                plan,
+                started_at,
+                after_probe,
+                timings_ms,
+            ) = _load_and_probe_task(task)
         except Exception as exc:
             self._results.append(
                 WorkerResult(
@@ -513,6 +608,29 @@ class InlineProcessorWorkerPool:
                 },
             )
         )
+        try:
+            descriptor, payload, completed_timings_ms = _complete_payload_task(
+                task,
+                image,
+                plan,
+                started_at=started_at,
+                after_probe=after_probe,
+                timings_ms=timings_ms,
+            )
+        except Exception as exc:
+            self._results.append(
+                WorkerResult(
+                    cache_key=task.cache_key,
+                    epoch=task.epoch,
+                    worker_id=task.assigned_worker_id,
+                    event_type="failed",
+                    at_ms=_now_ms(),
+                    schedule_item=schedule_item,
+                    timings_ms=timings_ms,
+                    error_message=f"{exc.__class__.__name__}: {exc}",
+                )
+            )
+            return
         self._results.append(
             WorkerResult(
                 cache_key=task.cache_key,
@@ -523,7 +641,7 @@ class InlineProcessorWorkerPool:
                 schedule_item=schedule_item,
                 descriptor=descriptor,
                 payload=payload,
-                timings_ms=timings_ms,
+                timings_ms=completed_timings_ms,
             )
         )
 
@@ -536,6 +654,9 @@ class InlineProcessorWorkerPool:
         del self._results[:max_items]
         return results
 
+    def poll_ready(self, max_items: int | None = None) -> list[WorkerResult]:
+        return self.poll(max_items=max_items)
+
     def close(self) -> None:
         self._results.clear()
 
@@ -546,6 +667,7 @@ class MultiProcessProcessorWorkerPool:
         self.worker_count = self._config.worker_count
         self._ctx = mp.get_context(self._config.start_method)
         self._result_queue: "mp.queues.Queue[WorkerResult]" = self._ctx.Queue()
+        self._ready_result_queue: "mp.queues.Queue[WorkerResult]" = self._ctx.Queue()
         self._task_queues: list["mp.queues.Queue[WorkerTask | None]"] = []
         self._processes: list[mp.Process] = []
         self._closed = False
@@ -557,7 +679,13 @@ class MultiProcessProcessorWorkerPool:
                 cpu_affinity = self._config.cpu_affinity_map[worker_id]
             process = self._ctx.Process(
                 target=_worker_main,
-                args=(task_queue, self._result_queue, worker_id, cpu_affinity),
+                args=(
+                    task_queue,
+                    self._result_queue,
+                    self._ready_result_queue,
+                    worker_id,
+                    cpu_affinity,
+                ),
                 daemon=True,
             )
             process.start()
@@ -579,6 +707,16 @@ class MultiProcessProcessorWorkerPool:
                 break
         return results
 
+    def poll_ready(self, max_items: int | None = None) -> list[WorkerResult]:
+        limit = max_items if max_items is not None else self.worker_count * 4
+        results: list[WorkerResult] = []
+        while len(results) < limit:
+            try:
+                results.append(self._ready_result_queue.get_nowait())
+            except queue.Empty:
+                break
+        return results
+
     def close(self) -> None:
         if self._closed:
             return
@@ -592,5 +730,10 @@ class MultiProcessProcessorWorkerPool:
         while True:
             try:
                 self._result_queue.get_nowait()
+            except queue.Empty:
+                break
+        while True:
+            try:
+                self._ready_result_queue.get_nowait()
             except queue.Empty:
                 break

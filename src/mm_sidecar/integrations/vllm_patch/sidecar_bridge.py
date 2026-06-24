@@ -714,6 +714,15 @@ def prepare_capture_for_sidecar(
             "handles": [],
             "initial_statuses": [],
             "reason": "sidecar_manager_unavailable",
+            "timings_ms": {
+                "manager_prepare": 0.0,
+                "batch_get_status": 0.0,
+                "descriptor_only_metadata_retry": 0.0,
+                "source_plan_preview": 0.0,
+                "manager_stats": 0.0,
+                "total": 0.0,
+            },
+            "manager_stats": None,
         }
         capture.set_sidecar_prepare(payload)
         return payload
@@ -798,19 +807,6 @@ def prepare_capture_for_sidecar(
                 f"planned={len(planned_items)} expected={len(descriptors)}"
             )
     after_status = time.perf_counter()
-    coordinator = SidecarFallbackCoordinator(
-        manager=manager,
-        claimer_id=capture.request_id,
-        producer_rank=0,
-        near_ready_wait_ms=float(os.getenv("MM_SIDECAR_NEAR_READY_WAIT_MS", "0.0")),
-    )
-    source_plan_preview = coordinator.preview_source_plan(
-        descriptors=descriptors,
-        handles=handles,
-    )
-    after_preview = time.perf_counter()
-    stats = manager.stats()
-    after_stats = time.perf_counter()
 
     payload = {
         "enabled": True,
@@ -825,28 +821,18 @@ def prepare_capture_for_sidecar(
             _serialize_schedule_item(item, descriptor)
             for item, descriptor in zip(planned_items, descriptors)
         ],
-        "source_plan_preview": _serialize_source_plan(source_plan_preview),
+        "source_plan_preview": None,
         "handles": [_serialize_handle(handle) for handle in handles],
         "initial_statuses": [_serialize_snapshot(snapshot) for snapshot in snapshots],
         "timings_ms": {
             "manager_prepare": (after_prepare - prepare_start) * 1000.0,
             "batch_get_status": metadata_wait_total_ms,
             "descriptor_only_metadata_retry": descriptor_only_metadata_retry_ms,
-            "source_plan_preview": (after_preview - after_status) * 1000.0,
-            "manager_stats": (after_stats - after_preview) * 1000.0,
-            "total": (after_stats - prepare_start) * 1000.0,
+            "source_plan_preview": 0.0,
+            "manager_stats": 0.0,
+            "total": (after_status - prepare_start) * 1000.0,
         },
-        "manager_stats": {
-            "queued_items": stats.queued_items,
-            "running_items": stats.running_items,
-            "ready_items": stats.ready_items,
-            "failed_items": stats.failed_items,
-            "fallback_claimed_items": stats.fallback_claimed_items,
-            "reusable_cache_items": stats.reusable_cache_items,
-            "reusable_cache_bytes": stats.reusable_cache_bytes,
-            "active_inflight_items": stats.active_inflight_items,
-            "observed_at_ms": stats.observed_at_ms,
-        },
+        "manager_stats": None,
     }
     capture.set_sidecar_prepare(payload)
     return payload

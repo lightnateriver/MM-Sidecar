@@ -3,6 +3,7 @@ from __future__ import annotations
 import threading
 import time
 from dataclasses import dataclass
+from typing import cast
 
 from mm_sidecar.contracts import ArtifactDescriptor, ImageScheduleItem
 
@@ -83,8 +84,19 @@ class SidecarManager:
             worker_id: 0 for worker_id in range(self._worker_pool.worker_count)
         }
         self._lock = threading.RLock()
+        self._ready_drain_stop = threading.Event()
+        self._ready_drain_thread: threading.Thread | None = None
+        if hasattr(self._worker_pool, "poll_ready"):
+            self._ready_drain_thread = threading.Thread(
+                target=self._ready_drain_loop,
+                daemon=True,
+            )
+            self._ready_drain_thread.start()
 
     def close(self) -> None:
+        self._ready_drain_stop.set()
+        if self._ready_drain_thread is not None:
+            self._ready_drain_thread.join(timeout=1.0)
         self._worker_pool.close()
 
     def prepare(
@@ -210,6 +222,7 @@ class SidecarManager:
             time.sleep(poll_interval_ms / 1000.0)
 
     def fetch_ready(self, handle: SidecarHandle) -> PreparedArtifact | None:
+        self._drain_ready_results()
         self._drain_results()
         with self._lock:
             entry = self._entries.get(handle.cache_key)
@@ -324,6 +337,7 @@ class SidecarManager:
             return entry.to_snapshot()
 
     def stats(self) -> SidecarManagerStats:
+        self._drain_ready_results()
         self._drain_results()
         with self._lock:
             counts = {
@@ -402,6 +416,24 @@ class SidecarManager:
         with self._lock:
             for result in results:
                 self._apply_worker_result(result)
+
+    def _drain_ready_results(self, max_items: int | None = None) -> int:
+        poll_ready = getattr(self._worker_pool, "poll_ready", None)
+        if poll_ready is None:
+            return 0
+        results = cast(list[WorkerResult], poll_ready(max_items=max_items))
+        if not results:
+            return 0
+        with self._lock:
+            for result in results:
+                self._apply_worker_result(result)
+        return len(results)
+
+    def _ready_drain_loop(self) -> None:
+        while not self._ready_drain_stop.is_set():
+            drained = self._drain_ready_results(max_items=1)
+            if drained == 0:
+                time.sleep(0.0005)
 
     def _apply_worker_result(self, result: WorkerResult) -> None:
         entry = self._entries.get(result.cache_key)
