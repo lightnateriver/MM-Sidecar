@@ -121,6 +121,17 @@ def _vit_dp_direct_encode_enabled() -> bool:
     return value in {"1", "true", "yes", "on"}
 
 
+def _native_vit_dp_full_replacement_mode(
+    model_runner: Any,
+    role: TpWorkerRole,
+) -> bool:
+    return (
+        role.world_size > 1
+        and _uses_vit_data_parallel(model_runner)
+        and not _vit_dp_direct_encode_enabled()
+    )
+
+
 def _read_non_negative_int_env(*names: str) -> int | None:
     for name in names:
         raw = os.getenv(name)
@@ -1760,6 +1771,10 @@ def try_replace_scheduled_mm_inputs_from_sidecar(
     )
 
     replaced = 0
+    native_vit_dp_full_replacement = _native_vit_dp_full_replacement_mode(
+        model_runner,
+        role,
+    )
     for req_id in scheduled_encoder_inputs:
         req_state = requests.get(req_id)
         if req_state is None:
@@ -1840,7 +1855,12 @@ def try_replace_scheduled_mm_inputs_from_sidecar(
                 observe_plan_wait_ms=_peer_plan_wait_ms(),
             )
             plan_start = time.perf_counter()
-            if (
+            if native_vit_dp_full_replacement:
+                source_plan = coordinator.preview_source_plan(
+                    descriptors=descriptors,
+                    handles=handles,
+                )
+            elif (
                 role.world_size > 1
                 and not role.is_coordinator
                 and not selection.use_vit_data_parallel
@@ -1887,7 +1907,7 @@ def try_replace_scheduled_mm_inputs_from_sidecar(
                     local_artifacts = _run_local_fallback_artifacts(
                         fetch_batch.fallback_descriptors,
                     )
-                    if role.world_size > 1:
+                    if role.world_size > 1 and not native_vit_dp_full_replacement:
                         _publish_local_fallback_artifacts(
                             client,
                             fetch_batch.source_plan,

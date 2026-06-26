@@ -1019,6 +1019,110 @@ class VllmPatchWorkerSidecarTests(unittest.TestCase):
             self.assertEqual(req_state.mm_features[1].data["kind"], "local-real")
             self.assertFalse(getattr(req_state, "mm_sidecar_vit_dp_prepared", False))
 
+    def test_try_replace_vit_dp_default_rank1_does_not_wait_for_peer_plan(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            image_path0 = Path(tmpdir) / "worker-vit-dp-rank1-0.jpg"
+            image_path1 = Path(tmpdir) / "worker-vit-dp-rank1-1.jpg"
+            _make_image().save(image_path0, format="JPEG")
+            _make_image().save(image_path1, format="JPEG")
+            with Image.open(image_path0) as image0, Image.open(image_path1) as image1:
+                normalized0 = build_normalized_image_from_url(
+                    image_url=f"file://{image_path0}",
+                    image=image0,
+                    media_uuid="uuid-worker-vit-dp-rank1-0",
+                    request_scope_key="req-worker-vit-dp-rank1",
+                    item_index=0,
+                )
+                normalized1 = build_normalized_image_from_url(
+                    image_url=f"file://{image_path1}",
+                    image=image1,
+                    media_uuid="uuid-worker-vit-dp-rank1-1",
+                    request_scope_key="req-worker-vit-dp-rank1",
+                    item_index=1,
+                )
+
+            manager = SidecarManager(worker_pool=_ManualWorkerPool())
+            capture = RequestCapture(
+                request_id="req-worker-vit-dp-rank1",
+                method="POST",
+                path="/v1/chat/completions",
+                sidecar_manager=manager,
+            )
+            capture.add_normalized_image(0, "uuid-worker-vit-dp-rank1-0", normalized0)
+            capture.add_normalized_image(1, "uuid-worker-vit-dp-rank1-1", normalized1)
+            params = _FakeParams()
+            prepare_capture_for_sidecar(capture, _FakeRenderer(), params)
+            attach_sidecar_payload_to_params(params, capture)
+
+            req_state = _FakeReqState(params)
+            synthetic_feature0 = _FakeFeature()
+            synthetic_feature0.data = type(
+                "SyntheticFeatureData",
+                (),
+                {"_mm_sidecar_synthetic_placeholder": True},
+            )()
+            synthetic_feature1 = _FakeFeature()
+            synthetic_feature1.data = type(
+                "SyntheticFeatureData",
+                (),
+                {"_mm_sidecar_synthetic_placeholder": True},
+            )()
+            req_state.mm_features = [synthetic_feature0, synthetic_feature1]
+            runner = type("Runner", (), {})()
+            runner.requests = {"req-worker-vit-dp-rank1": req_state}
+            runner.model = SimpleNamespace(use_data_parallel=True)
+            scheduler_output = _FakeSchedulerOutput(
+                "req-worker-vit-dp-rank1",
+                encoder_input_ids=[0, 1],
+            )
+
+            def fake_replace_feature_data(state, artifacts):
+                for artifact in artifacts:
+                    state.mm_features[int(artifact.handle.request_media_index)].data = {
+                        "kind": "rank1-local-fallback",
+                    }
+                return len(artifacts)
+
+            with mock.patch(
+                "mm_sidecar.integrations.vllm_patch.worker_sidecar.get_worker_sidecar_client",
+                return_value=manager,
+            ), mock.patch(
+                "mm_sidecar.integrations.vllm_patch.worker_sidecar._resolve_tp_worker_role",
+                return_value=TpWorkerRole(
+                    local_rank=1,
+                    world_size=2,
+                    coordinator_rank=0,
+                    is_coordinator=False,
+                ),
+            ), mock.patch(
+                "mm_sidecar.integrations.vllm_patch.worker_sidecar.SidecarFallbackCoordinator.observe_source_plan",
+                side_effect=AssertionError("native ViT-DP must not wait for peer plan"),
+            ), mock.patch(
+                "mm_sidecar.integrations.vllm_patch.worker_sidecar._publish_local_fallback_artifacts",
+                side_effect=AssertionError("native ViT-DP preview fallback must not publish"),
+            ), mock.patch(
+                "mm_sidecar.integrations.vllm_patch.worker_sidecar.replace_feature_data_from_sidecar_artifacts",
+                side_effect=fake_replace_feature_data,
+            ):
+                replaced = try_replace_scheduled_mm_inputs_from_sidecar(
+                    runner,
+                    scheduler_output,
+                )
+
+            self.assertEqual(replaced, 2)
+            self.assertEqual(
+                req_state.mm_features[0].data["kind"],
+                "rank1-local-fallback",
+            )
+            self.assertEqual(
+                req_state.mm_features[1].data["kind"],
+                "rank1-local-fallback",
+            )
+            source_plan = getattr(req_state, "mm_sidecar_source_plan")
+            self.assertEqual(source_plan.entries[0].reason, "preview_requires_fallback")
+            self.assertEqual(source_plan.entries[0].producer_rank, 1)
+            manager.close()
+
     def test_try_replace_vit_dp_direct_mode_prepares_without_stock_replacement(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             image_path0 = Path(tmpdir) / "worker-vit-dp-direct-0.jpg"
