@@ -238,6 +238,16 @@ def _remote_fallback_wait_ms() -> float:
         return 1_000.0
 
 
+def _native_vit_dp_ready_wait_ms() -> float:
+    raw = os.getenv("MM_SIDECAR_NATIVE_VIT_DP_READY_WAIT_MS")
+    if raw is None or not raw.strip():
+        return 50.0
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return 50.0
+
+
 def _mode_is_data(value: Any) -> bool:
     if value is None:
         return False
@@ -1849,16 +1859,22 @@ def try_replace_scheduled_mm_inputs_from_sidecar(
                 manager=client,
                 claimer_id=claimer_id,
                 producer_rank=role.local_rank,
-                near_ready_wait_ms=2.0,
+                near_ready_wait_ms=(
+                    _native_vit_dp_ready_wait_ms()
+                    if native_vit_dp_full_replacement
+                    else 2.0
+                ),
                 poll_interval_ms=1.0,
                 fallback_wait_ms=_remote_fallback_wait_ms(),
                 observe_plan_wait_ms=_peer_plan_wait_ms(),
             )
             plan_start = time.perf_counter()
             if native_vit_dp_full_replacement:
-                source_plan = coordinator.preview_source_plan(
+                source_plan = coordinator.build_source_plan(
                     descriptors=descriptors,
                     handles=handles,
+                    claim=False,
+                    wait_for_ready=True,
                 )
             elif (
                 role.world_size > 1

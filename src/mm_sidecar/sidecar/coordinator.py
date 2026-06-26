@@ -123,7 +123,7 @@ class SidecarFallbackCoordinator:
 
         waited_ms = 0.0
         final = initial
-        if claim and wait_for_ready and unresolved_indexes and self._near_ready_wait_ms > 0.0:
+        if wait_for_ready and unresolved_indexes and self._near_ready_wait_ms > 0.0:
             wait_start = _now_ms()
             deadline = wait_start + self._near_ready_wait_ms
             while True:

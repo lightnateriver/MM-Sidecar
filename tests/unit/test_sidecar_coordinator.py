@@ -233,6 +233,36 @@ class SidecarCoordinatorTests(unittest.TestCase):
             )
             manager.close()
 
+    def test_no_claim_source_plan_can_wait_for_ready_without_claiming(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            image_path = Path(tmpdir) / "preview-ready.jpg"
+            image_path.write_bytes(_make_jpeg_bytes())
+
+            manager = SidecarManager(worker_pool=InlineProcessorWorkerPool())
+            descriptor = _make_descriptor(image_path, "req-preview-ready", 0)
+            handles = manager.prepare([descriptor])
+
+            coordinator = SidecarFallbackCoordinator(
+                manager=manager,
+                claimer_id="rank-preview-ready",
+                producer_rank=3,
+                near_ready_wait_ms=500.0,
+                poll_interval_ms=1.0,
+            )
+            plan = coordinator.build_source_plan(
+                descriptors=[descriptor],
+                handles=list(handles),
+                claim=False,
+                wait_for_ready=True,
+            )
+
+            self.assertEqual(plan.entries[0].decision, SourcePlanDecision.USE_SIDECAR)
+            self.assertIsNone(plan.entries[0].producer_rank)
+            self.assertGreaterEqual(plan.near_ready_wait_ms, 0.0)
+            snapshots = manager.batch_get_status(handles)
+            self.assertIsNone(snapshots[0].claimed_by)
+            manager.close()
+
     def test_claim_denied_raises_instead_of_repeating_fallback(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             image_path = Path(tmpdir) / "claim_denied.jpg"
