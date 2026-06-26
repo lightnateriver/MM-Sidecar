@@ -8,6 +8,8 @@ from .coordinator import (
     SourcePlan,
     SourcePlanDecision,
     SourcePlanEntry,
+    build_ranked_claimer_id,
+    parse_ranked_claimer_id,
 )
 from .manager import SidecarManager
 from .processor import (
@@ -60,6 +62,8 @@ __all__ = [
     "SourcePlanEntry",
     "WorkerPoolConfig",
     "build_cache_key",
+    "build_ranked_claimer_id",
     "create_sidecar_client",
+    "parse_ranked_claimer_id",
     "sidecar_service_config_from_env",
 ]

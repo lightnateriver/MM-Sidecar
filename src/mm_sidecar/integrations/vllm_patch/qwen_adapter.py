@@ -104,6 +104,29 @@ def _build_qwen_mm_kwargs_item(
     )
 
 
+def _planned_item_qwen_shape_info(
+    planned_item: dict[str, Any],
+    *,
+    processor_signature: str | None,
+) -> tuple[tuple[int, int, int], int, int]:
+    raw_grid_thw = planned_item.get("image_grid_thw")
+    if not isinstance(raw_grid_thw, (list, tuple)) or len(raw_grid_thw) != 3:
+        raise ValueError("planned_item requires image_grid_thw 3-tuple")
+
+    grid_thw = tuple(int(value) for value in raw_grid_thw)
+    item_signature = (
+        None
+        if planned_item.get("processor_signature") is None
+        else str(planned_item.get("processor_signature"))
+    )
+    effective_signature = item_signature or processor_signature
+    patch_size = _int_signature_value(effective_signature, "patch", 14)
+    temporal_patch_size = _int_signature_value(effective_signature, "temporal", 1)
+    spatial_merge_size = _spatial_merge_size_from_signature(effective_signature)
+    flattened_patch_size = 3 * temporal_patch_size * patch_size * patch_size
+    return grid_thw, spatial_merge_size, flattened_patch_size
+
+
 def sidecar_artifact_to_qwen_mm_kwargs_item(
     artifact: PreparedArtifact,
 ):
@@ -132,27 +155,46 @@ def planned_item_to_synthetic_qwen_mm_kwargs_item(
 ):
     import torch
 
-    raw_grid_thw = planned_item.get("image_grid_thw")
-    if not isinstance(raw_grid_thw, (list, tuple)) or len(raw_grid_thw) != 3:
-        raise ValueError("planned_item requires image_grid_thw 3-tuple")
-
-    grid_thw = tuple(int(value) for value in raw_grid_thw)
-    item_signature = (
-        None
-        if planned_item.get("processor_signature") is None
-        else str(planned_item.get("processor_signature"))
+    grid_thw, spatial_merge_size, flattened_patch_size = (
+        _planned_item_qwen_shape_info(
+            planned_item,
+            processor_signature=processor_signature,
+        )
     )
-    effective_signature = item_signature or processor_signature
-    patch_size = _int_signature_value(effective_signature, "patch", 14)
-    temporal_patch_size = _int_signature_value(effective_signature, "temporal", 1)
-    spatial_merge_size = _spatial_merge_size_from_signature(effective_signature)
-    flattened_patch_size = 3 * temporal_patch_size * patch_size * patch_size
 
     # The API server only needs shape-bearing placeholders to drive native
     # prompt update logic. Real pixel_values are supplied later by sidecar or
     # TP-worker fallback before encoder execution.
     pixel_values = torch.empty(
         (0, flattened_patch_size),
+        dtype=torch.float32,
+    )
+    image_grid_thw = torch.tensor([grid_thw], dtype=torch.long)
+    item = _build_qwen_mm_kwargs_item(
+        pixel_values=pixel_values,
+        image_grid_thw=image_grid_thw,
+        spatial_merge_size=spatial_merge_size,
+    )
+    setattr(item, SYNTHETIC_PLACEHOLDER_ATTR, True)
+    return item
+
+
+def planned_item_to_vit_dp_placeholder_qwen_mm_kwargs_item(
+    planned_item: dict[str, Any],
+    *,
+    processor_signature: str | None,
+):
+    import torch
+
+    grid_thw, spatial_merge_size, flattened_patch_size = (
+        _planned_item_qwen_shape_info(
+            planned_item,
+            processor_signature=processor_signature,
+        )
+    )
+
+    pixel_values = torch.zeros(
+        (int(grid_thw[0]) * int(grid_thw[1]) * int(grid_thw[2]), flattened_patch_size),
         dtype=torch.float32,
     )
     image_grid_thw = torch.tensor([grid_thw], dtype=torch.long)

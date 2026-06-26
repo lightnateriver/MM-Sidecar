@@ -24,6 +24,8 @@ from mm_sidecar.sidecar import (
 )
 from mm_sidecar.sidecar.config import MemoryCacheConfig, SidecarManagerConfig, WorkerPoolConfig
 from mm_sidecar.sidecar.protocol import FallbackDescriptor
+from mm_sidecar.sidecar.coordinator import build_ranked_claimer_id
+from mm_sidecar.sidecar.processor import run_descriptor_locally
 
 
 def _make_processor_signature() -> ProcessorSignature:
@@ -130,6 +132,10 @@ class SidecarServiceTests(unittest.TestCase):
                 self.assertIsNotNone(artifact)
                 assert artifact is not None
                 self.assertEqual(artifact.payload.image_grid_thw, (1, 36, 20))
+                self.assertIsNotNone(artifact.fetch_diagnostics_ms)
+                assert artifact.fetch_diagnostics_ms is not None
+                self.assertIn("client_rpc_total", artifact.fetch_diagnostics_ms)
+                self.assertIn("manager_fetch_total", artifact.fetch_diagnostics_ms)
             finally:
                 try:
                     client.shutdown()
@@ -165,6 +171,64 @@ class SidecarServiceTests(unittest.TestCase):
                 self.assertIsNotNone(artifact)
                 assert artifact is not None
                 self.assertEqual(artifact.payload.image_grid_thw, (1, 36, 20))
+                self.assertIsNotNone(artifact.fetch_diagnostics_ms)
+                assert artifact.fetch_diagnostics_ms is not None
+                self.assertIn("client_rpc_total", artifact.fetch_diagnostics_ms)
+                self.assertIn("manager_fetch_total", artifact.fetch_diagnostics_ms)
+            finally:
+                try:
+                    client.shutdown()
+                finally:
+                    service.join(timeout=2.0)
+                    service.terminate()
+
+    def test_service_can_publish_and_fetch_request_local_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            image_path = Path(tmpdir) / "service-fallback-local.jpg"
+            image_path.write_bytes(_make_jpeg_bytes())
+            service = SidecarServiceProcess(
+                SidecarServiceConfig(
+                    worker_pool_mode="process",
+                    start_method="fork",
+                    manager=SidecarManagerConfig(
+                        cache=MemoryCacheConfig(max_reusable_bytes=8 * 1024 * 1024),
+                        workers=WorkerPoolConfig(worker_count=1, start_method="fork"),
+                    ),
+                )
+            )
+            client = service.start()
+            try:
+                descriptor = _build_local_descriptor(image_path)
+                handles = client.prepare([descriptor])
+                claim_id = build_ranked_claimer_id(
+                    request_id=descriptor.request_id,
+                    producer_rank=0,
+                )
+                claims = client.try_fallback_claim(handles, claim_id)
+                self.assertTrue(claims[0].granted)
+                local_artifact = run_descriptor_locally(
+                    descriptor,
+                    epoch=claims[0].handle.epoch,
+                )
+                snapshot = client.publish_fallback_local_result(
+                    claims[0].handle,
+                    claim_id,
+                    local_artifact.descriptor,
+                    local_artifact.payload,
+                    local_artifact.timings_ms,
+                )
+                self.assertEqual(snapshot.state, SidecarState.FALLBACK_LOCAL_DONE)
+                artifact = client.fetch_ready(claims[0].handle)
+                self.assertIsNotNone(artifact)
+                assert artifact is not None
+                self.assertEqual(
+                    artifact.payload.image_grid_thw,
+                    local_artifact.payload.image_grid_thw,
+                )
+                self.assertIsNotNone(artifact.fetch_diagnostics_ms)
+                assert artifact.fetch_diagnostics_ms is not None
+                self.assertIn("client_rpc_total", artifact.fetch_diagnostics_ms)
+                self.assertIn("manager_local_payload", artifact.fetch_diagnostics_ms)
             finally:
                 try:
                     client.shutdown()

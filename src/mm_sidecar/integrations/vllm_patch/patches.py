@@ -17,6 +17,7 @@ from mm_sidecar.integrations.vllm_patch.context import (
 from mm_sidecar.integrations.vllm_patch.normalization import (
     build_captured_image_ref,
     build_normalized_image_from_capture,
+    probe_normalized_image_from_capture,
 )
 from mm_sidecar.integrations.vllm_patch.sidecar_bridge import (
     describe_sidecar_runtime_config,
@@ -233,6 +234,38 @@ def _prepare_sidecar_if_possible(
         return None
 
 
+def _try_capture_descriptor_only_probe(
+    *,
+    item_index: int | None,
+    captured_ref: Any | None,
+    explicit_uuid: str | None,
+) -> bool:
+    capture = get_current_capture()
+    if capture is None or item_index is None or captured_ref is None:
+        return False
+
+    try:
+        normalized_image = probe_normalized_image_from_capture(
+            capture=captured_ref,
+        )
+    except Exception as exc:
+        capture.add_error(
+            f"image[{item_index}] descriptor-only probe failed: "
+            f"{exc.__class__.__name__}: {exc}"
+        )
+        return False
+    if normalized_image is None:
+        return False
+
+    media_uuid = explicit_uuid or f"{capture.request_id}:image:{item_index}"
+    capture.add_normalized_image(
+        item_index=item_index,
+        media_uuid=media_uuid,
+        normalized_image=normalized_image,
+    )
+    return True
+
+
 def _descriptor_only_dummy_image() -> Any:
     from PIL import Image
 
@@ -355,7 +388,15 @@ def apply_monkey_patches() -> None:
                     )
                 ),
             )
-            if descriptor_only_capture_enabled() and sidecar_prepare_result is not None:
+            if (
+                descriptor_only_capture_enabled()
+                and sidecar_prepare_result is not None
+                and _try_capture_descriptor_only_probe(
+                    item_index=item_index,
+                    captured_ref=captured_ref,
+                    explicit_uuid=uuid,
+                )
+            ):
                 return _descriptor_only_dummy_image(), uuid
             try:
                 image, resolved_uuid = await original_async_image(self, image_url, uuid)
@@ -396,7 +437,15 @@ def apply_monkey_patches() -> None:
                 ),
             )
 
-            if descriptor_only_capture_enabled() and sidecar_prepare_result is not None:
+            if (
+                descriptor_only_capture_enabled()
+                and sidecar_prepare_result is not None
+                and _try_capture_descriptor_only_probe(
+                    item_index=item_index,
+                    captured_ref=captured_ref,
+                    explicit_uuid=uuid,
+                )
+            ):
                 image = _descriptor_only_dummy_image()
             else:
                 try:

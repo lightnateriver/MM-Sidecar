@@ -84,6 +84,7 @@ class SidecarLookupResult:
     descriptor: FallbackDescriptor | None
     state: SidecarState
     updated_at_ms: float
+    claimed_by: str | None = None
     error_message: str | None = None
 
 
@@ -107,6 +108,7 @@ class PreparedArtifact:
     descriptor: ArtifactDescriptor
     payload: Any
     timings_ms: dict[str, float] | None = None
+    fetch_diagnostics_ms: dict[str, float] | None = None
 
 
 @dataclass(frozen=True, slots=True)

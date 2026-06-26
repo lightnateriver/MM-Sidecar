@@ -15,6 +15,7 @@ from mm_sidecar.contracts import (
 from mm_sidecar.integrations.vllm_patch.qwen_adapter import (
     is_synthetic_qwen_mm_kwargs_item,
     planned_item_to_synthetic_qwen_mm_kwargs_item,
+    planned_item_to_vit_dp_placeholder_qwen_mm_kwargs_item,
     replace_feature_data_from_sidecar_artifacts,
     sidecar_artifact_to_qwen_mm_kwargs_item,
 )
@@ -115,6 +116,21 @@ class VllmPatchQwenAdapterTests(unittest.TestCase):
         self.assertIn("pixel_values", item)
         self.assertIn("image_grid_thw", item)
         self.assertEqual(tuple(item["pixel_values"].data.shape), (0, 1176))
+        self.assertEqual(item["image_grid_thw"].data.tolist(), [1, 36, 20])
+        self.assertTrue(item["image_grid_thw"].field.keep_on_cpu)
+
+    def test_planned_item_to_vit_dp_placeholder_qwen_mm_kwargs_item(self) -> None:
+        item = planned_item_to_vit_dp_placeholder_qwen_mm_kwargs_item(
+            {
+                "request_media_index": 0,
+                "image_grid_thw": [1, 36, 20],
+                "processor_signature": _make_signature().value,
+            },
+            processor_signature=None,
+        )
+
+        self.assertTrue(is_synthetic_qwen_mm_kwargs_item(item))
+        self.assertEqual(tuple(item["pixel_values"].data.shape), (720, 588))
         self.assertEqual(item["image_grid_thw"].data.tolist(), [1, 36, 20])
         self.assertTrue(item["image_grid_thw"].field.keep_on_cpu)
 

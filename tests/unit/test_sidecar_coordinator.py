@@ -25,7 +25,9 @@ from mm_sidecar.sidecar import (
     SidecarState,
     SourcePlanDecision,
 )
+from mm_sidecar.sidecar.coordinator import build_ranked_claimer_id
 from mm_sidecar.sidecar.processor import WorkerResult, WorkerTask
+from mm_sidecar.sidecar.processor import run_descriptor_locally
 from mm_sidecar.sidecar.protocol import FallbackDescriptor
 
 
@@ -287,6 +289,83 @@ class SidecarCoordinatorTests(unittest.TestCase):
             self.assertEqual(batch.source_plan, plan)
             self.assertEqual(len(batch.sidecar_artifacts), 1)
             self.assertEqual(len(batch.fallback_descriptors), 0)
+            manager.close()
+
+    def test_consumer_observes_and_fetches_request_local_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            image_path = Path(tmpdir) / "consumer-fallback.jpg"
+            image_path.write_bytes(_make_jpeg_bytes())
+
+            worker_pool = _ManualWorkerPool()
+            manager = SidecarManager(worker_pool=worker_pool)
+            descriptor = _make_descriptor(image_path, "req-consumer-fallback", 0)
+            handles = manager.prepare([descriptor])
+
+            coordinator = SidecarFallbackCoordinator(
+                manager=manager,
+                claimer_id=build_ranked_claimer_id(
+                    request_id="req-consumer-fallback",
+                    producer_rank=0,
+                ),
+                producer_rank=0,
+                near_ready_wait_ms=0.0,
+            )
+            claimed_plan = coordinator.build_source_plan(
+                descriptors=[descriptor],
+                handles=list(handles),
+            )
+            self.assertEqual(
+                claimed_plan.entries[0].decision,
+                SourcePlanDecision.FALLBACK,
+            )
+            claimed_handle = claimed_plan.entries[0].handle
+            self.assertIsNotNone(claimed_handle)
+            assert claimed_handle is not None
+
+            local_artifact = run_descriptor_locally(
+                descriptor,
+                epoch=claimed_handle.epoch,
+            )
+            snapshot = manager.publish_fallback_local_result(
+                claimed_handle,
+                build_ranked_claimer_id(
+                    request_id="req-consumer-fallback",
+                    producer_rank=0,
+                ),
+                local_artifact.descriptor,
+                local_artifact.payload,
+                local_artifact.timings_ms,
+            )
+            self.assertEqual(snapshot.state, SidecarState.FALLBACK_LOCAL_DONE)
+
+            consumer = SidecarFallbackCoordinator(
+                manager=manager,
+                claimer_id=build_ranked_claimer_id(
+                    request_id="req-consumer-fallback",
+                    producer_rank=1,
+                ),
+                producer_rank=1,
+                near_ready_wait_ms=0.0,
+                fallback_wait_ms=20.0,
+                observe_plan_wait_ms=20.0,
+            )
+            observed_plan = consumer.observe_source_plan(descriptors=[descriptor])
+            self.assertEqual(
+                observed_plan.entries[0].decision,
+                SourcePlanDecision.FALLBACK,
+            )
+            self.assertEqual(observed_plan.entries[0].producer_rank, 0)
+
+            batch = consumer.fetch_according_to_plan(
+                descriptors=[descriptor],
+                source_plan=observed_plan,
+            )
+            self.assertEqual(len(batch.sidecar_artifacts), 1)
+            self.assertEqual(len(batch.fallback_descriptors), 0)
+            self.assertEqual(
+                batch.sidecar_artifacts[0].payload.image_grid_thw,
+                local_artifact.payload.image_grid_thw,
+            )
             manager.close()
 
     def test_stale_handle_from_previous_request_cannot_claim_or_fetch(self) -> None:

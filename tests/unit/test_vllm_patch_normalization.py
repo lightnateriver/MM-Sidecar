@@ -11,7 +11,10 @@ from PIL import Image
 from mm_sidecar.contracts import MediaTransport
 from mm_sidecar.integrations.vllm_patch.context import RequestCapture
 from mm_sidecar.integrations.vllm_patch.normalization import (
+    build_captured_image_ref,
     build_normalized_image_from_url,
+    can_probe_normalized_image_from_capture,
+    probe_normalized_image_from_capture,
 )
 
 
@@ -84,6 +87,54 @@ class VllmPatchNormalizationTests(unittest.TestCase):
             self.assertEqual(normalized.local_materialized_path, str(image_path.resolve()))
             self.assertEqual(normalized.orig_size_hw, (512, 288))
             self.assertIsNotNone(normalized.byte_size)
+
+    def test_probe_normalized_image_from_capture_for_local_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            image_path = Path(tmpdir) / "probe-local.jpg"
+            _make_image().save(image_path, format="JPEG")
+
+            capture = build_captured_image_ref(
+                image_url=f"file://{image_path}",
+                media_uuid="uuid-probe-local",
+                request_scope_key="req-probe-local",
+                item_index=0,
+            )
+
+            self.assertTrue(can_probe_normalized_image_from_capture(capture=capture))
+            normalized = probe_normalized_image_from_capture(capture=capture)
+
+            self.assertIsNotNone(normalized)
+            assert normalized is not None
+            self.assertEqual(normalized.source_ref.transport, MediaTransport.LOCAL_PATH)
+            self.assertEqual(normalized.orig_size_hw, (512, 288))
+
+    def test_probe_normalized_image_from_capture_for_base64(self) -> None:
+        data_url = _make_base64_data_url()
+        capture = build_captured_image_ref(
+            image_url=data_url,
+            media_uuid="uuid-probe-b64",
+            request_scope_key="req-probe-b64",
+            item_index=1,
+        )
+
+        self.assertTrue(can_probe_normalized_image_from_capture(capture=capture))
+        normalized = probe_normalized_image_from_capture(capture=capture)
+
+        self.assertIsNotNone(normalized)
+        assert normalized is not None
+        self.assertEqual(normalized.source_ref.transport, MediaTransport.BASE64)
+        self.assertEqual(normalized.orig_size_hw, (512, 288))
+
+    def test_probe_normalized_image_from_capture_skips_http(self) -> None:
+        capture = build_captured_image_ref(
+            image_url="https://example.com/demo.jpg",
+            media_uuid="uuid-probe-http",
+            request_scope_key="req-probe-http",
+            item_index=2,
+        )
+
+        self.assertFalse(can_probe_normalized_image_from_capture(capture=capture))
+        self.assertIsNone(probe_normalized_image_from_capture(capture=capture))
 
     def test_request_capture_serialization(self) -> None:
         capture = RequestCapture(request_id="req-1", method="POST", path="/v1/chat/completions")

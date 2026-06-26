@@ -445,6 +445,23 @@ def _serialize_schedule_item(
     }
 
 
+def _serialize_planned_items(
+    planned_items: list[ImageScheduleItem],
+    descriptors: list[FallbackDescriptor],
+) -> list[dict[str, Any]]:
+    descriptor_by_index = {
+        int(descriptor.request_media_index): descriptor
+        for descriptor in descriptors
+    }
+    serialized: list[dict[str, Any]] = []
+    for item in planned_items:
+        descriptor = descriptor_by_index.get(int(item.item_index))
+        if descriptor is None:
+            continue
+        serialized.append(_serialize_schedule_item(item, descriptor))
+    return serialized
+
+
 def _schedule_item_from_snapshot(
     snapshot: Any,
 ) -> ImageScheduleItem | None:
@@ -706,10 +723,7 @@ def prepare_capture_for_sidecar(
             "processor_signature": (
                 descriptors[0].processor_signature_value if descriptors else None
             ),
-            "planned_items": [
-                _serialize_schedule_item(item, descriptor)
-                for item, descriptor in zip(planned_items, descriptors)
-            ],
+            "planned_items": _serialize_planned_items(planned_items, descriptors),
             "source_plan_preview": _serialize_source_plan(source_plan_preview),
             "handles": [],
             "initial_statuses": [],
@@ -817,10 +831,7 @@ def prepare_capture_for_sidecar(
         "processor_signature": (
             descriptors[0].processor_signature_value if descriptors else None
         ),
-        "planned_items": [
-            _serialize_schedule_item(item, descriptor)
-            for item, descriptor in zip(planned_items, descriptors)
-        ],
+        "planned_items": _serialize_planned_items(planned_items, descriptors),
         "source_plan_preview": None,
         "handles": [_serialize_handle(handle) for handle in handles],
         "initial_statuses": [_serialize_snapshot(snapshot) for snapshot in snapshots],

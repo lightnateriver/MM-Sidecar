@@ -45,6 +45,29 @@ class SidecarFetchBatch:
     fallback_descriptors: tuple[FallbackDescriptor, ...]
 
 
+_CLAIMER_RANK_MARKER = "::producer_rank="
+
+
+def build_ranked_claimer_id(*, request_id: str, producer_rank: int) -> str:
+    return f"{request_id}{_CLAIMER_RANK_MARKER}{int(producer_rank)}"
+
+
+def parse_ranked_claimer_id(claimer_id: str | None) -> int | None:
+    if not claimer_id:
+        return None
+    marker_index = claimer_id.rfind(_CLAIMER_RANK_MARKER)
+    if marker_index < 0:
+        return None
+    raw_rank = claimer_id[marker_index + len(_CLAIMER_RANK_MARKER):].strip()
+    if not raw_rank:
+        return None
+    try:
+        parsed = int(raw_rank)
+    except ValueError:
+        return None
+    return parsed if parsed >= 0 else None
+
+
 def _now_ms() -> float:
     return time.perf_counter() * 1000.0
 
@@ -58,12 +81,16 @@ class SidecarFallbackCoordinator:
         producer_rank: int,
         near_ready_wait_ms: float = 2.0,
         poll_interval_ms: float = 1.0,
+        fallback_wait_ms: float = 1_000.0,
+        observe_plan_wait_ms: float = 50.0,
     ) -> None:
         self._manager = manager
         self._claimer_id = claimer_id
         self._producer_rank = producer_rank
         self._near_ready_wait_ms = near_ready_wait_ms
         self._poll_interval_ms = poll_interval_ms
+        self._fallback_wait_ms = fallback_wait_ms
+        self._observe_plan_wait_ms = observe_plan_wait_ms
 
     def build_source_plan(
         self,
@@ -150,7 +177,7 @@ class SidecarFallbackCoordinator:
                         request_media_index=handle.request_media_index,
                         decision=SourcePlanDecision.FALLBACK,
                         producer_rank=self._producer_rank,
-                        handle=handle,
+                        handle=claim_result.handle,
                         state=snapshot.state if snapshot is not None else SidecarState.ABSENT,
                         reason="fallback_claim_granted",
                     )
@@ -165,6 +192,29 @@ class SidecarFallbackCoordinator:
                         handle=handle,
                         state=claim_result.state,
                         reason="ready_after_claim_race",
+                    )
+                )
+                continue
+
+            claimed_rank = parse_ranked_claimer_id(
+                claim_result.claimed_by if claim_result is not None else None
+            )
+            if (
+                claim_result is not None
+                and claim_result.state in {
+                    SidecarState.FALLBACK_CLAIMED,
+                    SidecarState.FALLBACK_LOCAL_DONE,
+                }
+                and claimed_rank is not None
+            ):
+                entries.append(
+                    SourcePlanEntry(
+                        request_media_index=handle.request_media_index,
+                        decision=SourcePlanDecision.FALLBACK,
+                        producer_rank=claimed_rank,
+                        handle=claim_result.handle,
+                        state=claim_result.state,
+                        reason="fallback_claim_already_owned",
                     )
                 )
                 continue
@@ -235,6 +285,12 @@ class SidecarFallbackCoordinator:
                 raise RuntimeError(
                     f"fallback descriptor missing for media index {entry.request_media_index}"
                 )
+            if (
+                entry.producer_rank is not None
+                and entry.producer_rank != self._producer_rank
+            ):
+                sidecar_artifacts.append(self._wait_and_fetch_remote_fallback(entry))
+                continue
             fallback_descriptors.append(descriptor)
 
         return SidecarFetchBatch(
@@ -285,8 +341,123 @@ class SidecarFallbackCoordinator:
             wait_for_ready=False,
         )
 
+    def observe_source_plan(
+        self,
+        *,
+        descriptors: list[FallbackDescriptor] | tuple[FallbackDescriptor, ...],
+        wait_timeout_ms: float | None = None,
+    ) -> SourcePlan:
+        if not descriptors:
+            raise ValueError("descriptors must not be empty")
+        if self._manager is None:
+            return self._build_fail_open_plan(descriptors)
+
+        started_ms = _now_ms()
+        deadline_ms = started_ms + max(
+            0.0,
+            self._observe_plan_wait_ms if wait_timeout_ms is None else wait_timeout_ms,
+        )
+        cache_keys = [descriptor.cache_key for descriptor in descriptors]
+        while True:
+            lookups = self._manager.lookup_by_cache_keys(cache_keys)
+            entries = self._build_observed_entries(
+                descriptors=descriptors,
+                lookups=lookups,
+            )
+            if entries is not None:
+                return SourcePlan(
+                    request_id=descriptors[0].request_id,
+                    entries=entries,
+                    near_ready_wait_ms=max(0.0, _now_ms() - started_ms),
+                    used_fail_open=False,
+                )
+            if _now_ms() >= deadline_ms:
+                break
+            time.sleep(self._poll_interval_ms / 1000.0)
+
+        raise RuntimeError(
+            "coordinator source plan unavailable for "
+            f"request {descriptors[0].request_id}"
+        )
+
+    def _build_observed_entries(
+        self,
+        *,
+        descriptors: list[FallbackDescriptor] | tuple[FallbackDescriptor, ...],
+        lookups: tuple[Any, ...],
+    ) -> tuple[SourcePlanEntry, ...] | None:
+        lookup_by_key = {
+            lookup.cache_key: lookup
+            for lookup in lookups
+        }
+        entries: list[SourcePlanEntry] = []
+        for descriptor in descriptors:
+            lookup = lookup_by_key.get(descriptor.cache_key)
+            if lookup is None or lookup.handle is None:
+                return None
+            if lookup.state is SidecarState.READY:
+                entries.append(
+                    SourcePlanEntry(
+                        request_media_index=descriptor.request_media_index,
+                        decision=SourcePlanDecision.USE_SIDECAR,
+                        handle=lookup.handle,
+                        state=lookup.state,
+                        reason="ready_observed_from_manager",
+                    )
+                )
+                continue
+            if lookup.state in {
+                SidecarState.FALLBACK_CLAIMED,
+                SidecarState.FALLBACK_LOCAL_DONE,
+            }:
+                claimed_rank = parse_ranked_claimer_id(lookup.claimed_by)
+                if claimed_rank is None:
+                    return None
+                entries.append(
+                    SourcePlanEntry(
+                        request_media_index=descriptor.request_media_index,
+                        decision=SourcePlanDecision.FALLBACK,
+                        producer_rank=claimed_rank,
+                        handle=lookup.handle,
+                        state=lookup.state,
+                        reason="fallback_observed_from_manager",
+                    )
+                )
+                continue
+            return None
+        return tuple(
+            sorted(entries, key=lambda item: int(item.request_media_index))
+        )
+
+    def _wait_and_fetch_remote_fallback(
+        self,
+        entry: SourcePlanEntry,
+    ) -> PreparedArtifact:
+        if self._manager is None or entry.handle is None:
+            raise RuntimeError("remote fallback fetch requires manager/handle")
+        snapshots = self._manager.wait_for_states(
+            [entry.handle],
+            {SidecarState.READY, SidecarState.FALLBACK_LOCAL_DONE},
+            timeout_ms=self._fallback_wait_ms,
+            poll_interval_ms=self._poll_interval_ms,
+        )
+        snapshot = snapshots[0]
+        if snapshot.state not in {SidecarState.READY, SidecarState.FALLBACK_LOCAL_DONE}:
+            raise RuntimeError(
+                "remote fallback artifact unavailable for media index "
+                f"{entry.request_media_index}: state={snapshot.state.value}"
+            )
+        artifact = self._manager.fetch_ready(snapshot.handle)
+        if artifact is None:
+            raise RuntimeError(
+                f"remote fallback artifact missing for media index {entry.request_media_index}"
+            )
+        return artifact
+
 
 __all__ = [
+    "build_ranked_claimer_id",
+    "parse_ranked_claimer_id",
     "SidecarFallbackCoordinator",
     "SidecarFetchBatch",
     "SourcePlan",

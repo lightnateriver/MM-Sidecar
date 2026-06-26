@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import mimetypes
+from base64 import b64decode
+from io import BytesIO
 from pathlib import Path
 from urllib.parse import urlsplit
 from urllib.request import url2pathname
@@ -165,6 +167,47 @@ def build_normalized_image_from_capture(
         decoded_size_hw=orig_size_hw,
         local_materialized_path=capture.local_materialized_path,
     )
+
+
+def can_probe_normalized_image_from_capture(
+    *,
+    capture: CapturedImageRef,
+) -> bool:
+    transport = capture.source_ref.transport
+    return transport in {
+        MediaTransport.LOCAL_PATH,
+        MediaTransport.BASE64,
+    }
+
+
+def probe_normalized_image_from_capture(
+    *,
+    capture: CapturedImageRef,
+) -> NormalizedImage | None:
+    if not can_probe_normalized_image_from_capture(capture=capture):
+        return None
+
+    source_ref = capture.source_ref
+    if source_ref.transport is MediaTransport.LOCAL_PATH:
+        local_path = source_ref.local_path
+        if not local_path:
+            return None
+        with Image.open(local_path) as image:
+            return build_normalized_image_from_capture(
+                capture=capture,
+                image=image,
+            )
+
+    image_url = source_ref.image_url
+    if not image_url or "," not in image_url:
+        return None
+    payload = image_url.split(",", 1)[1].strip()
+    raw_bytes = b64decode(payload)
+    with BytesIO(raw_bytes) as buffer, Image.open(buffer) as image:
+        return build_normalized_image_from_capture(
+            capture=capture,
+            image=image,
+        )
 
 
 def build_normalized_image_from_url(

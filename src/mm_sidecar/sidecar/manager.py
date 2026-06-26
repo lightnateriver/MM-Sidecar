@@ -3,7 +3,7 @@ from __future__ import annotations
 import threading
 import time
 from dataclasses import dataclass
-from typing import cast
+from typing import Any, cast
 
 from mm_sidecar.contracts import ArtifactDescriptor, ImageScheduleItem
 
@@ -43,6 +43,8 @@ class _ManagedEntry:
     schedule_item: ImageScheduleItem | None = None
     timings_ms: dict[str, float] | None = None
     error_message: str | None = None
+    fallback_local_payload: Any | None = None
+    fallback_local_timings_ms: dict[str, float] | None = None
 
     def build_handle(self) -> SidecarHandle:
         return SidecarHandle(
@@ -174,6 +176,7 @@ class SidecarManager:
                         descriptor=entry.descriptor,
                         state=entry.state,
                         updated_at_ms=entry.updated_at_ms,
+                        claimed_by=entry.claimed_by,
                         error_message=entry.error_message,
                     )
                 )
@@ -222,8 +225,11 @@ class SidecarManager:
             time.sleep(poll_interval_ms / 1000.0)
 
     def fetch_ready(self, handle: SidecarHandle) -> PreparedArtifact | None:
+        fetch_started_ms = _now_ms()
         self._drain_ready_results()
+        after_ready_drain_ms = _now_ms()
         self._drain_results()
+        after_result_drain_ms = _now_ms()
         with self._lock:
             entry = self._entries.get(handle.cache_key)
             if entry is None:
@@ -231,11 +237,52 @@ class SidecarManager:
             self._refresh_ready_entry(entry)
             if not self._handle_matches_entry(handle, entry):
                 return None
-            if entry.state is not SidecarState.READY:
+            if entry.state not in {SidecarState.READY, SidecarState.FALLBACK_LOCAL_DONE}:
                 return None
             if entry.epoch != handle.epoch:
                 return None
+            if entry.state is SidecarState.FALLBACK_LOCAL_DONE:
+                if (
+                    entry.artifact_descriptor is None
+                    or entry.fallback_local_payload is None
+                ):
+                    return None
+                cache_get_finished_ms = _now_ms()
+                entry.updated_at_ms = _now_ms()
+                return PreparedArtifact(
+                    handle=handle,
+                    descriptor=entry.artifact_descriptor,
+                    payload=entry.fallback_local_payload,
+                    timings_ms=(
+                        dict(entry.fallback_local_timings_ms)
+                        if entry.fallback_local_timings_ms is not None
+                        else (
+                            dict(entry.timings_ms)
+                            if entry.timings_ms is not None
+                            else None
+                        )
+                    ),
+                    fetch_diagnostics_ms={
+                        "manager_fetch_total": max(0.0, _now_ms() - fetch_started_ms),
+                        "manager_ready_drain": max(
+                            0.0,
+                            after_ready_drain_ms - fetch_started_ms,
+                        ),
+                        "manager_result_drain": max(
+                            0.0,
+                            after_result_drain_ms - after_ready_drain_ms,
+                        ),
+                        "manager_cache_get": 0.0,
+                        "manager_post_cache": max(
+                            0.0,
+                            _now_ms() - cache_get_finished_ms,
+                        ),
+                        "manager_local_payload": 1.0,
+                    },
+                )
+            cache_get_started_ms = _now_ms()
             cached = self._cache_pool.get(handle.cache_key)
+            cache_get_finished_ms = _now_ms()
             if cached is None:
                 entry.state = SidecarState.EXPIRED
                 entry.updated_at_ms = _now_ms()
@@ -248,6 +295,25 @@ class SidecarManager:
                 descriptor=descriptor,
                 payload=payload,
                 timings_ms=dict(entry.timings_ms) if entry.timings_ms is not None else None,
+                fetch_diagnostics_ms={
+                    "manager_fetch_total": max(0.0, _now_ms() - fetch_started_ms),
+                    "manager_ready_drain": max(
+                        0.0,
+                        after_ready_drain_ms - fetch_started_ms,
+                    ),
+                    "manager_result_drain": max(
+                        0.0,
+                        after_result_drain_ms - after_ready_drain_ms,
+                    ),
+                    "manager_cache_get": max(
+                        0.0,
+                        cache_get_finished_ms - cache_get_started_ms,
+                    ),
+                    "manager_post_cache": max(
+                        0.0,
+                        _now_ms() - cache_get_finished_ms,
+                    ),
+                },
             )
 
     def try_fallback_claim(
@@ -298,6 +364,9 @@ class SidecarManager:
                     entry.epoch += 1
                     entry.state = SidecarState.FALLBACK_CLAIMED
                     entry.claimed_by = claimer_id
+                    entry.artifact_descriptor = None
+                    entry.fallback_local_payload = None
+                    entry.fallback_local_timings_ms = None
                     entry.updated_at_ms = _now_ms()
                     entry.error_message = None
                     granted = True
@@ -316,6 +385,64 @@ class SidecarManager:
                     )
                 )
         return tuple(results)
+
+    def publish_fallback_local_result(
+        self,
+        handle: SidecarHandle,
+        claimer_id: str,
+        descriptor: ArtifactDescriptor,
+        payload: Any,
+        timings_ms: dict[str, float] | None = None,
+    ) -> SidecarStatusSnapshot:
+        with self._lock:
+            entry = self._entries.get(handle.cache_key)
+            if entry is None:
+                return SidecarStatusSnapshot(
+                    handle=handle,
+                    state=SidecarState.ABSENT,
+                    epoch=handle.epoch,
+                    updated_at_ms=_now_ms(),
+                    error_message="entry_not_found",
+                )
+            if not self._handle_matches_entry(handle, entry):
+                return SidecarStatusSnapshot(
+                    handle=entry.build_handle(),
+                    state=entry.state,
+                    epoch=entry.epoch,
+                    updated_at_ms=entry.updated_at_ms,
+                    owner_worker_id=entry.owner_worker_id,
+                    claimed_by=entry.claimed_by,
+                    artifact_descriptor=entry.artifact_descriptor,
+                    schedule_item=entry.schedule_item,
+                    timings_ms=(
+                        dict(entry.timings_ms) if entry.timings_ms is not None else None
+                    ),
+                    error_message="stale_handle",
+                )
+            if entry.claimed_by != claimer_id:
+                return SidecarStatusSnapshot(
+                    handle=entry.build_handle(),
+                    state=entry.state,
+                    epoch=entry.epoch,
+                    updated_at_ms=entry.updated_at_ms,
+                    owner_worker_id=entry.owner_worker_id,
+                    claimed_by=entry.claimed_by,
+                    artifact_descriptor=entry.artifact_descriptor,
+                    schedule_item=entry.schedule_item,
+                    timings_ms=(
+                        dict(entry.timings_ms) if entry.timings_ms is not None else None
+                    ),
+                    error_message="claim_mismatch",
+                )
+            entry.state = SidecarState.FALLBACK_LOCAL_DONE
+            entry.artifact_descriptor = descriptor
+            entry.fallback_local_payload = payload
+            entry.fallback_local_timings_ms = (
+                dict(timings_ms) if timings_ms is not None else None
+            )
+            entry.updated_at_ms = _now_ms()
+            entry.error_message = None
+            return entry.to_snapshot()
 
     def mark_fallback_local_done(
         self,
@@ -486,6 +613,8 @@ class SidecarManager:
             self._cache_pool.put(result.cache_key, result.descriptor, result.payload)
             entry.state = SidecarState.READY
             entry.artifact_descriptor = result.descriptor
+            entry.fallback_local_payload = None
+            entry.fallback_local_timings_ms = None
             if result.schedule_item is not None:
                 entry.schedule_item = result.schedule_item
             entry.timings_ms = dict(result.timings_ms) if result.timings_ms is not None else None

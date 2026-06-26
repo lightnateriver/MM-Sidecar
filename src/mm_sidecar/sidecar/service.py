@@ -18,6 +18,10 @@ from .processor import InlineProcessorWorkerPool, MultiProcessProcessorWorkerPoo
 SidecarAddress = str | tuple[str, int]
 
 
+def _now_perf_ms() -> float:
+    return time.perf_counter() * 1000.0
+
+
 def _safe_int(raw: str | None, default: int) -> int:
     if raw is None:
         return default
@@ -300,6 +304,7 @@ class SidecarClient:
         self.socket_path = address if family == "AF_UNIX" else None
 
     def _request(self, method_name: str, *args: Any, **kwargs: Any) -> Any:
+        request_started_ms = _now_perf_ms()
         conn = Client(address=self.address, family=self.family)
         try:
             conn.send((method_name, args, kwargs))
@@ -308,7 +313,16 @@ class SidecarClient:
             conn.close()
         if not payload.get("ok"):
             raise RuntimeError(payload.get("error", "sidecar request failed"))
-        return payload.get("result")
+        result = payload.get("result")
+        if method_name == "fetch_ready" and result is not None:
+            diagnostics = getattr(result, "fetch_diagnostics_ms", None)
+            merged = dict(diagnostics) if isinstance(diagnostics, dict) else {}
+            merged["client_rpc_total"] = max(0.0, _now_perf_ms() - request_started_ms)
+            try:
+                object.__setattr__(result, "fetch_diagnostics_ms", merged)
+            except Exception:
+                pass
+        return result
 
     def prepare(self, descriptors: list[Any] | tuple[Any, ...]):
         return self._request("prepare", descriptors)
@@ -359,6 +373,23 @@ class SidecarClient:
 
     def mark_fallback_local_done(self, handle: Any, claimer_id: str):
         return self._request("mark_fallback_local_done", handle, claimer_id)
+
+    def publish_fallback_local_result(
+        self,
+        handle: Any,
+        claimer_id: str,
+        descriptor: Any,
+        payload: Any,
+        timings_ms: dict[str, float] | None = None,
+    ):
+        return self._request(
+            "publish_fallback_local_result",
+            handle,
+            claimer_id,
+            descriptor,
+            payload,
+            timings_ms,
+        )
 
     def stats(self):
         return self._request("stats")
