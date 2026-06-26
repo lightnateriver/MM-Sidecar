@@ -116,6 +116,11 @@ def _safe_mm_merge_enabled() -> bool:
     return value not in {"0", "false", "no", "off"}
 
 
+def _vit_dp_direct_encode_enabled() -> bool:
+    value = os.getenv("MM_SIDECAR_ENABLE_VIT_DP_DIRECT_ENCODE", "0").strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
+
 def _read_non_negative_int_env(*names: str) -> int | None:
     for name in names:
         raw = os.getenv(name)
@@ -429,7 +434,9 @@ def _select_worker_mm_shard(
         scheduled_image_indexes = tuple(sorted(descriptor_by_index))
 
     use_vit_data_parallel = (
-        role.world_size > 1 and _uses_vit_data_parallel(model_runner)
+        role.world_size > 1
+        and _uses_vit_data_parallel(model_runner)
+        and _vit_dp_direct_encode_enabled()
     )
     if not use_vit_data_parallel:
         local_image_indexes = scheduled_image_indexes
@@ -1617,6 +1624,8 @@ def _try_execute_vit_dp_sidecar_direct_encode(
     )
     if not scheduled_encoder_inputs:
         return None
+    if not _vit_dp_direct_encode_enabled():
+        return None
     if not _uses_vit_data_parallel(model_runner):
         return None
 
@@ -1760,7 +1769,11 @@ def try_replace_scheduled_mm_inputs_from_sidecar(
             binding = bind_request_mm_sidecar(req_state)
         if binding is None:
             continue
-        if role.world_size > 1 and _uses_vit_data_parallel(model_runner):
+        if (
+            role.world_size > 1
+            and _uses_vit_data_parallel(model_runner)
+            and _vit_dp_direct_encode_enabled()
+        ):
             setattr(req_state, "mm_sidecar_vit_dp_prepared", True)
             continue
         selection = _select_worker_mm_shard(

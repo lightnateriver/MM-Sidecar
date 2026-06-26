@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -922,7 +923,7 @@ class VllmPatchWorkerSidecarTests(unittest.TestCase):
             )
             manager.close()
 
-    def test_try_replace_vit_dp_only_processes_local_image_shard(self) -> None:
+    def test_try_replace_vit_dp_default_replaces_all_images_for_stock_encoder(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             image_path0 = Path(tmpdir) / "worker-vit-dp-0.jpg"
             image_path1 = Path(tmpdir) / "worker-vit-dp-1.jpg"
@@ -1007,6 +1008,87 @@ class VllmPatchWorkerSidecarTests(unittest.TestCase):
                         data=SimpleNamespace(shape=(4, 4))
                     ),
                 },
+            ):
+                replaced = try_replace_scheduled_mm_inputs_from_sidecar(
+                    runner,
+                    scheduler_output,
+                )
+
+            self.assertEqual(replaced, 2)
+            self.assertEqual(req_state.mm_features[0].data["kind"], "local-real")
+            self.assertEqual(req_state.mm_features[1].data["kind"], "local-real")
+            self.assertFalse(getattr(req_state, "mm_sidecar_vit_dp_prepared", False))
+
+    def test_try_replace_vit_dp_direct_mode_prepares_without_stock_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            image_path0 = Path(tmpdir) / "worker-vit-dp-direct-0.jpg"
+            image_path1 = Path(tmpdir) / "worker-vit-dp-direct-1.jpg"
+            _make_image().save(image_path0, format="JPEG")
+            _make_image().save(image_path1, format="JPEG")
+            with Image.open(image_path0) as image0, Image.open(image_path1) as image1:
+                normalized0 = build_normalized_image_from_url(
+                    image_url=f"file://{image_path0}",
+                    image=image0,
+                    media_uuid="uuid-worker-vit-dp-direct-0",
+                    request_scope_key="req-worker-vit-dp-direct",
+                    item_index=0,
+                )
+                normalized1 = build_normalized_image_from_url(
+                    image_url=f"file://{image_path1}",
+                    image=image1,
+                    media_uuid="uuid-worker-vit-dp-direct-1",
+                    request_scope_key="req-worker-vit-dp-direct",
+                    item_index=1,
+                )
+
+            capture = RequestCapture(
+                request_id="req-worker-vit-dp-direct",
+                method="POST",
+                path="/v1/chat/completions",
+                sidecar_manager=None,
+            )
+            capture.add_normalized_image(0, "uuid-worker-vit-dp-direct-0", normalized0)
+            capture.add_normalized_image(1, "uuid-worker-vit-dp-direct-1", normalized1)
+            params = _FakeParams()
+            prepare_capture_for_sidecar(capture, _FakeRenderer(), params)
+            attach_sidecar_payload_to_params(params, capture)
+
+            req_state = _FakeReqState(params)
+            synthetic_feature0 = _FakeFeature()
+            synthetic_feature0.data = type(
+                "SyntheticFeatureData",
+                (),
+                {"_mm_sidecar_synthetic_placeholder": True},
+            )()
+            synthetic_feature1 = _FakeFeature()
+            synthetic_feature1.data = type(
+                "SyntheticFeatureData",
+                (),
+                {"_mm_sidecar_synthetic_placeholder": True},
+            )()
+            req_state.mm_features = [synthetic_feature0, synthetic_feature1]
+            runner = type("Runner", (), {})()
+            runner.requests = {"req-worker-vit-dp-direct": req_state}
+            runner.model = SimpleNamespace(use_data_parallel=True)
+            scheduler_output = _FakeSchedulerOutput(
+                "req-worker-vit-dp-direct",
+                encoder_input_ids=[0, 1],
+            )
+
+            with mock.patch.dict(
+                os.environ,
+                {"MM_SIDECAR_ENABLE_VIT_DP_DIRECT_ENCODE": "1"},
+            ), mock.patch(
+                "mm_sidecar.integrations.vllm_patch.worker_sidecar._resolve_tp_worker_role",
+                return_value=TpWorkerRole(
+                    local_rank=0,
+                    world_size=2,
+                    coordinator_rank=0,
+                    is_coordinator=True,
+                ),
+            ), mock.patch(
+                "mm_sidecar.integrations.vllm_patch.worker_sidecar.replace_feature_data_from_sidecar_artifacts",
+                side_effect=AssertionError("stock replacement should not run"),
             ):
                 replaced = try_replace_scheduled_mm_inputs_from_sidecar(
                     runner,
