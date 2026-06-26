@@ -27,6 +27,7 @@ from mm_sidecar.integrations.vllm_patch.worker_sidecar import (
     _load_balance_assignment,
     _manual_encode_and_gather_local_items,
     _run_dp_sharded_mrope_vision_model_with_sidecar,
+    _try_execute_vit_dp_sidecar_direct_encode,
     _resolve_vit_dp_local_indices,
     bind_request_mm_sidecar,
     build_worker_source_plan,
@@ -1642,6 +1643,127 @@ class VllmPatchWorkerSidecarTests(unittest.TestCase):
             return_value=result,
         ):
             self.assertEqual(FakeGPUModelRunner()._execute_mm_encoder(scheduler_output), [])
+
+    def test_shard_fetch_gate_direct_writes_encoder_cache(self) -> None:
+        plan = SimpleNamespace(
+            image_features=(
+                SimpleNamespace(identifier="img-a"),
+                SimpleNamespace(identifier="img-b"),
+            ),
+            local_indices=(0,),
+            order=(0, 1),
+            counts=(1, 1),
+            binding=SimpleNamespace(request_id="req-shard-direct"),
+        )
+        runner = SimpleNamespace(
+            requests={"req-shard-direct": SimpleNamespace()},
+            model=SimpleNamespace(use_data_parallel=True),
+            encoder_cache={},
+            saved=[],
+            maybe_save_ec_to_connector=lambda cache, key: runner.saved.append(key),
+        )
+        scheduler_output = SimpleNamespace(
+            scheduled_encoder_inputs={"req-shard-direct": [0, 1]},
+        )
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                "MM_SIDECAR_ENABLE_VIT_DP_DIRECT_ENCODE": "0",
+                "MM_SIDECAR_ENABLE_VIT_DP_SHARD_FETCH": "1",
+            },
+        ), mock.patch(
+            "mm_sidecar.integrations.vllm_patch.worker_sidecar._uses_vit_data_parallel",
+            return_value=True,
+        ), mock.patch(
+            "mm_sidecar.integrations.vllm_patch.worker_sidecar._resolve_tp_worker_role",
+            return_value=TpWorkerRole(
+                local_rank=0,
+                world_size=2,
+                coordinator_rank=0,
+                is_coordinator=True,
+            ),
+        ), mock.patch(
+            "mm_sidecar.integrations.vllm_patch.worker_sidecar._build_vit_dp_execution_plan_for_request",
+            return_value=plan,
+        ), mock.patch(
+            "mm_sidecar.integrations.vllm_patch.worker_sidecar._sidecar_or_fallback_items_for_plan",
+            return_value=(["local-img-a"], {"payload_bytes": 123.0}),
+        ), mock.patch(
+            "mm_sidecar.integrations.vllm_patch.worker_sidecar._all_tp_ranks_ready_for_direct_encode",
+            return_value=True,
+        ), mock.patch(
+            "mm_sidecar.integrations.vllm_patch.worker_sidecar._manual_encode_and_gather_local_items",
+            return_value=("embed-a", "embed-b"),
+        ):
+            result = _try_execute_vit_dp_sidecar_direct_encode(
+                runner,
+                scheduler_output,
+            )
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result.handled_request_ids, ("req-shard-direct",))
+        self.assertEqual(result.fallback_scheduled, {})
+        self.assertEqual(
+            runner.encoder_cache,
+            {"img-a": "embed-a", "img-b": "embed-b"},
+        )
+        self.assertEqual(runner.saved, ["img-a", "img-b"])
+
+    def test_shard_fetch_gate_defers_to_vision_patch_when_not_all_ready(self) -> None:
+        runner = SimpleNamespace(
+            requests={"req-shard-defer": SimpleNamespace()},
+            model=SimpleNamespace(use_data_parallel=True),
+            encoder_cache={},
+        )
+        scheduler_output = SimpleNamespace(
+            scheduled_encoder_inputs={"req-shard-defer": [0]},
+        )
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                "MM_SIDECAR_ENABLE_VIT_DP_DIRECT_ENCODE": "0",
+                "MM_SIDECAR_ENABLE_VIT_DP_SHARD_FETCH": "1",
+            },
+        ), mock.patch(
+            "mm_sidecar.integrations.vllm_patch.worker_sidecar._uses_vit_data_parallel",
+            return_value=True,
+        ), mock.patch(
+            "mm_sidecar.integrations.vllm_patch.worker_sidecar._resolve_tp_worker_role",
+            return_value=TpWorkerRole(
+                local_rank=1,
+                world_size=2,
+                coordinator_rank=0,
+                is_coordinator=False,
+            ),
+        ), mock.patch(
+            "mm_sidecar.integrations.vllm_patch.worker_sidecar._build_vit_dp_execution_plan_for_request",
+            return_value=SimpleNamespace(
+                image_features=(SimpleNamespace(identifier="img-a"),),
+                local_indices=(),
+                order=(0,),
+                counts=(1, 0),
+                binding=SimpleNamespace(request_id="req-shard-defer"),
+            ),
+        ), mock.patch(
+            "mm_sidecar.integrations.vllm_patch.worker_sidecar._sidecar_or_fallback_items_for_plan",
+            return_value=([], {}),
+        ), mock.patch(
+            "mm_sidecar.integrations.vllm_patch.worker_sidecar._all_tp_ranks_ready_for_direct_encode",
+            return_value=False,
+        ), mock.patch(
+            "mm_sidecar.integrations.vllm_patch.worker_sidecar._manual_encode_and_gather_local_items",
+            side_effect=AssertionError("should defer before manual encode"),
+        ):
+            result = _try_execute_vit_dp_sidecar_direct_encode(
+                runner,
+                scheduler_output,
+            )
+
+        self.assertIsNone(result)
+        self.assertEqual(runner.encoder_cache, {})
 
     def test_manual_encode_and_gather_local_items_reconstructs_original_order(self) -> None:
         class _FakeTensor:

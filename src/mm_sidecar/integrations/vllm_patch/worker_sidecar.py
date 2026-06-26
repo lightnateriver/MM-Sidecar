@@ -2186,7 +2186,12 @@ def _try_execute_vit_dp_sidecar_direct_encode(
     )
     if not scheduled_encoder_inputs:
         return None
-    if not _vit_dp_direct_encode_enabled():
+    direct_encode_requested = _vit_dp_direct_encode_enabled()
+    shard_fetch_direct_requested = (
+        _vit_dp_shard_fetch_enabled()
+        and not direct_encode_requested
+    )
+    if not direct_encode_requested and not shard_fetch_direct_requested:
         return None
     if not _uses_vit_data_parallel(model_runner):
         return None
@@ -2194,6 +2199,15 @@ def _try_execute_vit_dp_sidecar_direct_encode(
     role = _resolve_tp_worker_role()
     handled_reqs: list[str] = []
     fallback_scheduled: dict[str, list[int]] = {}
+    ready_requests: list[
+        tuple[
+            str,
+            Any,
+            LocalShardExecutionPlan,
+            list[Any],
+            dict[str, float],
+        ]
+    ] = []
 
     for req_id, image_input_ids in scheduled_encoder_inputs.items():
         image_input_ids_list = list(image_input_ids)
@@ -2229,6 +2243,20 @@ def _try_execute_vit_dp_sidecar_direct_encode(
 
         all_ready = _all_tp_ranks_ready_for_direct_encode(ready, role=role)
         if not all_ready or plan is None:
+            if shard_fetch_direct_requested:
+                if error is not None:
+                    _append_runner_error(
+                        model_runner,
+                        "vit dp shard-fetch direct cache write deferred to "
+                        "vision patch for "
+                        f"{req_id}: {error.__class__.__name__}: {error}",
+                    )
+                _emit_worker_debug(
+                    f"req={req_id} shard_fetch_direct_defer "
+                    f"rank={role.local_rank}/{role.world_size} "
+                    f"local_ready={int(ready)} all_ready={int(all_ready)}"
+                )
+                return None
             fallback_scheduled[req_id] = image_input_ids_list
             if error is not None:
                 _append_runner_error(
@@ -2243,6 +2271,9 @@ def _try_execute_vit_dp_sidecar_direct_encode(
             )
             continue
 
+        ready_requests.append((req_id, req_state, plan, local_items, diagnostics))
+
+    for req_id, req_state, plan, local_items, diagnostics in ready_requests:
         try:
             gathered_outputs = _manual_encode_and_gather_local_items(
                 model_runner,
@@ -2273,7 +2304,8 @@ def _try_execute_vit_dp_sidecar_direct_encode(
         setattr(req_state, "mm_sidecar_last_fetch_profile_ms", diagnostics)
         handled_reqs.append(req_id)
         _emit_worker_debug(
-            f"req={plan.binding.request_id} direct_encode "
+            f"req={plan.binding.request_id} "
+            f"{'shard_fetch_direct_encode' if shard_fetch_direct_requested else 'direct_encode'} "
             f"rank={role.local_rank}/{role.world_size} "
             f"local_indices={list(plan.local_indices)} "
             f"total_images={len(plan.image_features)}"
