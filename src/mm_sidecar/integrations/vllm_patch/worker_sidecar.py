@@ -470,6 +470,8 @@ def _collect_vit_dp_shard_fetch_items(
         or not _uses_vit_data_parallel(model_runner)
     ):
         return None
+    if _get_model_visual(model_runner) is None:
+        return None
 
     requests = getattr(model_runner, "requests", None)
     scheduled_encoder_inputs = getattr(

@@ -1257,7 +1257,10 @@ class VllmPatchWorkerSidecarTests(unittest.TestCase):
             req_state.mm_features = [synthetic_feature0, synthetic_feature1]
             runner = type("Runner", (), {})()
             runner.requests = {"req-worker-vit-dp-shard": req_state}
-            runner.model = SimpleNamespace(use_data_parallel=True)
+            runner.model = SimpleNamespace(
+                use_data_parallel=True,
+                visual=SimpleNamespace(),
+            )
             scheduler_output = _FakeSchedulerOutput(
                 "req-worker-vit-dp-shard",
                 encoder_input_ids=[0, 1],
