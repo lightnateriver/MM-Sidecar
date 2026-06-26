@@ -34,6 +34,7 @@ from mm_sidecar.integrations.vllm_patch.api_fast_path import (
 )
 from mm_sidecar.integrations.vllm_patch.worker_sidecar import (
     install_gpu_model_runner_patch,
+    install_vit_dp_shard_fetch_patch,
 )
 from mm_sidecar.sidecar import (
     connect_sidecar_client_from_env,
@@ -527,6 +528,7 @@ def apply_monkey_patches() -> None:
         api_server.build_app = wrapped_build_app
         mm_processor_module.BaseMultiModalProcessor.apply = wrapped_mm_processor_apply
         install_gpu_model_runner_patch(gpu_model_runner.GPUModelRunner)
+        vision_patch_installed = install_vit_dp_shard_fetch_patch()
 
         _PATCH_STATE.update(
             {
@@ -536,6 +538,7 @@ def apply_monkey_patches() -> None:
                 "render_capture": True,
                 "api_fast_path": True,
                 "worker_sidecar_patch": True,
+                "vit_dp_shard_fetch_patch": vision_patch_installed,
                 "debug_route_default": _debug_route_enabled(),
             }
         )

@@ -20,9 +20,13 @@ from mm_sidecar.integrations.vllm_patch.sidecar_bridge import prepare_capture_fo
 from mm_sidecar.integrations.vllm_patch.worker_sidecar import (
     TpWorkerRole,
     VitDpDirectEncodeResult,
+    VitDpShardFetchContext,
+    VitDpShardFetchItem,
     _all_tp_ranks_ready_for_direct_encode,
     _build_vit_dp_execution_plan_for_request,
+    _load_balance_assignment,
     _manual_encode_and_gather_local_items,
+    _run_dp_sharded_mrope_vision_model_with_sidecar,
     _resolve_vit_dp_local_indices,
     bind_request_mm_sidecar,
     build_worker_source_plan,
@@ -1202,6 +1206,110 @@ class VllmPatchWorkerSidecarTests(unittest.TestCase):
             self.assertEqual(replaced, 0)
             self.assertTrue(getattr(req_state, "mm_sidecar_vit_dp_prepared", False))
 
+    def test_try_replace_vit_dp_shard_fetch_prepares_without_full_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            image_path0 = Path(tmpdir) / "worker-vit-dp-shard-0.jpg"
+            image_path1 = Path(tmpdir) / "worker-vit-dp-shard-1.jpg"
+            _make_image().save(image_path0, format="JPEG")
+            _make_image().save(image_path1, format="JPEG")
+            with Image.open(image_path0) as image0, Image.open(image_path1) as image1:
+                normalized0 = build_normalized_image_from_url(
+                    image_url=f"file://{image_path0}",
+                    image=image0,
+                    media_uuid="uuid-worker-vit-dp-shard-0",
+                    request_scope_key="req-worker-vit-dp-shard",
+                    item_index=0,
+                )
+                normalized1 = build_normalized_image_from_url(
+                    image_url=f"file://{image_path1}",
+                    image=image1,
+                    media_uuid="uuid-worker-vit-dp-shard-1",
+                    request_scope_key="req-worker-vit-dp-shard",
+                    item_index=1,
+                )
+
+            manager = SidecarManager(worker_pool=_ManualWorkerPool())
+            capture = RequestCapture(
+                request_id="req-worker-vit-dp-shard",
+                method="POST",
+                path="/v1/chat/completions",
+                sidecar_manager=manager,
+            )
+            capture.add_normalized_image(0, "uuid-worker-vit-dp-shard-0", normalized0)
+            capture.add_normalized_image(1, "uuid-worker-vit-dp-shard-1", normalized1)
+            params = _FakeParams()
+            prepare_capture_for_sidecar(capture, _FakeRenderer(), params)
+            attach_sidecar_payload_to_params(params, capture)
+
+            req_state = _FakeReqState(params)
+            synthetic_feature0 = _FakeFeature()
+            synthetic_feature0.data = type(
+                "SyntheticFeatureData",
+                (),
+                {"_mm_sidecar_synthetic_placeholder": True},
+            )()
+            synthetic_feature1 = _FakeFeature()
+            synthetic_feature1.data = type(
+                "SyntheticFeatureData",
+                (),
+                {"_mm_sidecar_synthetic_placeholder": True},
+            )()
+            req_state.mm_features = [synthetic_feature0, synthetic_feature1]
+            runner = type("Runner", (), {})()
+            runner.requests = {"req-worker-vit-dp-shard": req_state}
+            runner.model = SimpleNamespace(use_data_parallel=True)
+            scheduler_output = _FakeSchedulerOutput(
+                "req-worker-vit-dp-shard",
+                encoder_input_ids=[0, 1],
+            )
+
+            with mock.patch.dict(
+                os.environ,
+                {"MM_SIDECAR_ENABLE_VIT_DP_SHARD_FETCH": "1"},
+            ), mock.patch(
+                "mm_sidecar.integrations.vllm_patch.worker_sidecar.get_worker_sidecar_client",
+                return_value=manager,
+            ), mock.patch(
+                "mm_sidecar.integrations.vllm_patch.worker_sidecar._resolve_tp_worker_role",
+                return_value=TpWorkerRole(
+                    local_rank=0,
+                    world_size=2,
+                    coordinator_rank=0,
+                    is_coordinator=True,
+                ),
+            ), mock.patch(
+                "mm_sidecar.integrations.vllm_patch.worker_sidecar.planned_item_to_vit_dp_placeholder_qwen_mm_kwargs_item",
+                side_effect=lambda planned_item, processor_signature: {
+                    "kind": "vit-dp-shard-placeholder",
+                    "grid": planned_item["image_grid_thw"],
+                },
+            ), mock.patch(
+                "mm_sidecar.integrations.vllm_patch.worker_sidecar.replace_feature_data_from_sidecar_artifacts",
+                side_effect=AssertionError("full replacement should not run"),
+            ):
+                replaced = try_replace_scheduled_mm_inputs_from_sidecar(
+                    runner,
+                    scheduler_output,
+                )
+
+            self.assertEqual(replaced, 0)
+            self.assertEqual(
+                req_state.mm_features[0].data["kind"],
+                "vit-dp-shard-placeholder",
+            )
+            self.assertEqual(
+                req_state.mm_features[1].data["kind"],
+                "vit-dp-shard-placeholder",
+            )
+            self.assertTrue(
+                getattr(req_state, "mm_sidecar_vit_dp_shard_fetch_prepared", False)
+            )
+            self.assertEqual(
+                runner.mm_sidecar_last_vit_dp_shard_fetch_prepared_count,
+                2,
+            )
+            manager.close()
+
     def test_prepare_scheduled_mm_inputs_before_encoder_runs_once(self) -> None:
         runner = type("Runner", (), {})()
         runner.requests = {}
@@ -1614,6 +1722,94 @@ class VllmPatchWorkerSidecarTests(unittest.TestCase):
         self.assertEqual(outputs[0].values, ["a0", "a1"])
         self.assertEqual(outputs[1].values, ["b0"])
         self.assertEqual(outputs[2].values, ["c0", "c1", "c2"])
+
+    def test_vit_dp_shard_fetch_vision_helper_fetches_only_local_indices(self) -> None:
+        import torch
+
+        class _FakeVisionModel:
+            spatial_merge_size = 2
+            out_hidden_size = 1
+
+            def __init__(self) -> None:
+                self.seen_pixel_shape = None
+                self.seen_grid = None
+
+            def __call__(self, pixel_values_local, local_grid_thw_list):
+                self.seen_pixel_shape = tuple(pixel_values_local.shape)
+                self.seen_grid = [list(item) for item in local_grid_thw_list]
+                output_len = sum(
+                    int(item[0]) * int(item[1]) * int(item[2]) // 4
+                    for item in local_grid_thw_list
+                )
+                return torch.full((output_len, 1), 20.0)
+
+        role = TpWorkerRole(
+            local_rank=1,
+            world_size=2,
+            coordinator_rank=0,
+            is_coordinator=False,
+        )
+        binding = SimpleNamespace(request_id="req-vit-shard-helper")
+        req_state = SimpleNamespace()
+        context_items = tuple(
+            VitDpShardFetchItem(
+                req_id="req-vit-shard-helper",
+                req_state=req_state,
+                binding=binding,
+                feature=SimpleNamespace(),
+                request_media_index=index,
+                descriptor=SimpleNamespace(request_media_index=index),
+                handle=SimpleNamespace(request_media_index=index),
+                planned_item=None,
+                grid_thw=(1, 4, 4),
+            )
+            for index in range(3)
+        )
+        context = VitDpShardFetchContext(
+            model_runner=SimpleNamespace(),
+            role=role,
+            items=context_items,
+        )
+        seen_local_indices: list[tuple[int, ...]] = []
+
+        def fake_fetch(items, image_idxs_local, *, role, reference_pixel_values):
+            seen_local_indices.append(tuple(image_idxs_local))
+            return [torch.zeros((16, 3), dtype=reference_pixel_values.dtype)], {
+                "payload_bytes": 192.0,
+            }
+
+        def fake_all_gather(tensor, dim=0):
+            rank0 = torch.tensor([[10.0]] * 4 + [[30.0]] * 4, dtype=tensor.dtype)
+            return torch.cat([rank0, tensor], dim=dim)
+
+        with mock.patch.dict(
+            "sys.modules",
+            {
+                "vllm.distributed": SimpleNamespace(
+                    tensor_model_parallel_all_gather=fake_all_gather
+                )
+            },
+        ), mock.patch(
+            "mm_sidecar.integrations.vllm_patch.worker_sidecar._fetch_vit_dp_shard_pixel_values",
+            side_effect=fake_fetch,
+        ):
+            vision_model = _FakeVisionModel()
+            outputs = _run_dp_sharded_mrope_vision_model_with_sidecar(
+                vision_model,
+                torch.zeros((48, 3)),
+                [[1, 4, 4], [1, 4, 4], [1, 4, 4]],
+                rope_type="rope_3d",
+                context_items=context_items,
+                context=context,
+                vision_module=SimpleNamespace(
+                    get_load_balance_assignment=_load_balance_assignment
+                ),
+            )
+
+        self.assertEqual(seen_local_indices, [(1,)])
+        self.assertEqual(vision_model.seen_pixel_shape, (16, 3))
+        self.assertEqual(vision_model.seen_grid, [[1, 4, 4]])
+        self.assertEqual([float(item[0].item()) for item in outputs], [10.0, 20.0, 30.0])
 
 
 if __name__ == "__main__":

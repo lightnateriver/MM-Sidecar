@@ -33,9 +33,13 @@ from mm_sidecar.integrations.vllm_patch.qwen_adapter import (
 
 
 _PATCH_MARKER_ATTR = "_mm_sidecar_worker_patch_installed"
+_VISION_PATCH_MARKER_ATTR = "_mm_sidecar_vit_dp_shard_fetch_patch_installed"
+_VISION_ORIGINAL_FN_ATTR = "_mm_sidecar_original_run_dp_sharded_mrope_vision_model"
+_VIT_DP_SHARD_CONTEXT_ATTR = "_mm_sidecar_vit_dp_shard_fetch_context"
 _PREPARED_SCHEDULER_OUTPUT_ID_ATTR = (
     "_mm_sidecar_last_prepared_scheduler_output_id"
 )
+_MISSING_ATTR = object()
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,6 +94,27 @@ class VitDpDirectEncodeResult:
     fallback_scheduled: dict[str, list[int]]
 
 
+@dataclass(frozen=True, slots=True)
+class VitDpShardFetchItem:
+    req_id: str
+    req_state: Any
+    binding: WorkerSidecarBinding
+    feature: Any
+    request_media_index: int
+    descriptor: Any
+    handle: Any
+    planned_item: dict[str, Any] | None
+    grid_thw: tuple[int, int, int]
+
+
+@dataclass(slots=True)
+class VitDpShardFetchContext:
+    model_runner: Any
+    role: TpWorkerRole
+    items: tuple[VitDpShardFetchItem, ...]
+    cursor: int = 0
+
+
 _CLIENT_UNSET = object()
 _CLIENT_LOCK = Lock()
 _CLIENT_CACHE: Any | None | object = _CLIENT_UNSET
@@ -118,6 +143,11 @@ def _safe_mm_merge_enabled() -> bool:
 
 def _vit_dp_direct_encode_enabled() -> bool:
     value = os.getenv("MM_SIDECAR_ENABLE_VIT_DP_DIRECT_ENCODE", "0").strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
+
+def _vit_dp_shard_fetch_enabled() -> bool:
+    value = os.getenv("MM_SIDECAR_ENABLE_VIT_DP_SHARD_FETCH", "0").strip().lower()
     return value in {"1", "true", "yes", "on"}
 
 
@@ -425,6 +455,179 @@ def _binding_planned_items_by_index(
             planned_index = fallback_position
         planned_item_by_index[planned_index] = planned_item
     return planned_item_by_index
+
+
+def _collect_vit_dp_shard_fetch_items(
+    model_runner: Any,
+    scheduler_output: Any,
+    *,
+    role: TpWorkerRole,
+) -> tuple[VitDpShardFetchItem, ...] | None:
+    if (
+        role.world_size <= 1
+        or not _vit_dp_shard_fetch_enabled()
+        or _vit_dp_direct_encode_enabled()
+        or not _uses_vit_data_parallel(model_runner)
+    ):
+        return None
+
+    requests = getattr(model_runner, "requests", None)
+    scheduled_encoder_inputs = getattr(
+        scheduler_output,
+        "scheduled_encoder_inputs",
+        None,
+    )
+    if not isinstance(requests, dict) or not scheduled_encoder_inputs:
+        return None
+
+    items: list[VitDpShardFetchItem] = []
+    for req_id, image_input_ids in scheduled_encoder_inputs.items():
+        req_state = requests.get(req_id)
+        if req_state is None:
+            return None
+        binding = get_request_mm_sidecar_binding(req_state)
+        if binding is None:
+            binding = bind_request_mm_sidecar(req_state)
+        if binding is None or not binding.enabled:
+            return None
+
+        descriptor_by_index = {
+            int(descriptor.request_media_index): descriptor
+            for descriptor in binding.decoded_plan.fallback_descriptors
+        }
+        handle_by_index = {
+            int(handle.request_media_index): handle
+            for handle in binding.decoded_plan.handles
+        }
+        planned_item_by_index = _binding_planned_items_by_index(binding)
+        mm_features = getattr(req_state, "mm_features", None)
+        if not isinstance(mm_features, list):
+            return None
+
+        for raw_input_id in image_input_ids:
+            try:
+                request_media_index = int(raw_input_id)
+                feature = mm_features[request_media_index]
+            except Exception:
+                return None
+            if getattr(feature, "modality", None) != "image":
+                return None
+
+            descriptor = descriptor_by_index.get(request_media_index)
+            handle = handle_by_index.get(request_media_index)
+            if descriptor is None or handle is None:
+                return None
+
+            planned_item = planned_item_by_index.get(request_media_index)
+            grid_thw = _resolve_grid_thw_for_index(
+                req_state,
+                request_media_index,
+                planned_item,
+            )
+            if grid_thw is None:
+                return None
+
+            items.append(
+                VitDpShardFetchItem(
+                    req_id=str(req_id),
+                    req_state=req_state,
+                    binding=binding,
+                    feature=feature,
+                    request_media_index=request_media_index,
+                    descriptor=descriptor,
+                    handle=handle,
+                    planned_item=planned_item,
+                    grid_thw=grid_thw,
+                )
+            )
+
+    return tuple(items) if items else None
+
+
+def _materialize_vit_dp_shard_fetch_placeholders(
+    items: tuple[VitDpShardFetchItem, ...],
+) -> None:
+    for item in items:
+        if item.planned_item is None:
+            continue
+        item.feature.data = planned_item_to_vit_dp_placeholder_qwen_mm_kwargs_item(
+            item.planned_item,
+            processor_signature=item.binding.processor_signature,
+        )
+        setattr(item.req_state, "mm_sidecar_vit_dp_shard_fetch_prepared", True)
+
+
+def _context_slice_for_grid_thw(
+    context: VitDpShardFetchContext,
+    grid_thw_list: list[list[int]],
+) -> tuple[VitDpShardFetchItem, ...] | None:
+    count = len(grid_thw_list)
+    if count <= 0:
+        return None
+    start = context.cursor
+    end = start + count
+    if end > len(context.items):
+        return None
+    items = context.items[start:end]
+    for item, grid_thw in zip(items, grid_thw_list):
+        if tuple(int(value) for value in grid_thw) != item.grid_thw:
+            return None
+    context.cursor = end
+    return items
+
+
+def _get_model_visual(model_runner: Any) -> Any | None:
+    model = getattr(model_runner, "model", None)
+    if model is None:
+        get_model = getattr(model_runner, "get_model", None)
+        if callable(get_model):
+            try:
+                model = get_model()
+            except Exception:
+                model = None
+    return getattr(model, "visual", None)
+
+
+def _attach_vit_dp_shard_fetch_context(
+    model_runner: Any,
+    scheduler_output: Any,
+) -> list[tuple[Any, str, Any]]:
+    role = _resolve_tp_worker_role()
+    items = _collect_vit_dp_shard_fetch_items(
+        model_runner,
+        scheduler_output,
+        role=role,
+    )
+    if not items:
+        return []
+
+    visual = _get_model_visual(model_runner)
+    if visual is None:
+        return []
+
+    previous = getattr(visual, _VIT_DP_SHARD_CONTEXT_ATTR, _MISSING_ATTR)
+    context = VitDpShardFetchContext(
+        model_runner=model_runner,
+        role=role,
+        items=items,
+    )
+    setattr(visual, _VIT_DP_SHARD_CONTEXT_ATTR, context)
+    _emit_worker_debug(
+        "attached vit_dp_shard_fetch_context "
+        f"rank={role.local_rank}/{role.world_size} items={len(items)}"
+    )
+    return [(visual, _VIT_DP_SHARD_CONTEXT_ATTR, previous)]
+
+
+def _restore_patched_attrs(restored: list[tuple[Any, str, Any]]) -> None:
+    for target, attr_name, original_value in reversed(restored):
+        try:
+            if original_value is _MISSING_ATTR:
+                delattr(target, attr_name)
+            else:
+                setattr(target, attr_name, original_value)
+        except Exception:
+            pass
 
 
 def _select_worker_mm_shard(
@@ -1528,6 +1731,342 @@ def _sidecar_or_fallback_items_for_plan(
     )
 
 
+def _artifact_to_pixel_values_tensor(
+    artifact: Any,
+    *,
+    reference_pixel_values: Any,
+) -> Any:
+    import torch
+
+    payload = getattr(artifact, "payload", None)
+    raw_pixel_values = getattr(payload, "pixel_values", None)
+    if raw_pixel_values is None:
+        raise RuntimeError("sidecar artifact missing pixel_values payload")
+    if isinstance(raw_pixel_values, torch.Tensor):
+        tensor = raw_pixel_values
+    else:
+        tensor = torch.as_tensor(raw_pixel_values)
+    return tensor.to(
+        device=reference_pixel_values.device,
+        dtype=reference_pixel_values.dtype,
+    ).contiguous()
+
+
+def _fetch_vit_dp_shard_pixel_values(
+    items: tuple[VitDpShardFetchItem, ...],
+    image_idxs_local: list[int],
+    *,
+    role: TpWorkerRole,
+    reference_pixel_values: Any,
+) -> tuple[list[Any], dict[str, float]]:
+    if not image_idxs_local:
+        return [], {}
+
+    local_items = tuple(items[index] for index in image_idxs_local)
+    descriptors = [item.descriptor for item in local_items]
+    handles = [item.handle for item in local_items]
+    client = get_worker_sidecar_client(required=False)
+    diagnostics: dict[str, float] = {}
+    artifacts: list[Any] = []
+
+    if client is None:
+        artifacts.extend(_run_local_fallback_artifacts(descriptors))
+    else:
+        coordinator = SidecarFallbackCoordinator(
+            manager=client,
+            claimer_id=build_ranked_claimer_id(
+                request_id=local_items[0].binding.request_id,
+                producer_rank=role.local_rank,
+            ),
+            producer_rank=role.local_rank,
+            near_ready_wait_ms=_native_vit_dp_ready_wait_ms(),
+            poll_interval_ms=1.0,
+            fallback_wait_ms=_remote_fallback_wait_ms(),
+            observe_plan_wait_ms=_peer_plan_wait_ms(),
+        )
+        source_plan = coordinator.build_source_plan(
+            descriptors=descriptors,
+            handles=handles,
+            claim=False,
+            wait_for_ready=True,
+        )
+        fetch_batch = coordinator.fetch_according_to_plan(
+            descriptors=descriptors,
+            handles=handles,
+            source_plan=source_plan,
+        )
+        artifacts.extend(fetch_batch.sidecar_artifacts)
+        if fetch_batch.fallback_descriptors:
+            artifacts.extend(_run_local_fallback_artifacts(fetch_batch.fallback_descriptors))
+
+    artifact_by_index = {
+        int(artifact.handle.request_media_index): artifact for artifact in artifacts
+    }
+    pixel_tensors: list[Any] = []
+    for item in local_items:
+        artifact = artifact_by_index.get(item.request_media_index)
+        if artifact is None:
+            raise RuntimeError(
+                "vit dp shard fetch missing artifact for "
+                f"media index {item.request_media_index}"
+            )
+        pixel_tensors.append(
+            _artifact_to_pixel_values_tensor(
+                artifact,
+                reference_pixel_values=reference_pixel_values,
+            )
+        )
+
+    diagnostics.update(_merge_fetch_diagnostics(artifacts))
+    diagnostics["payload_bytes"] = float(_artifact_payload_bytes(artifacts))
+    diagnostics["artifact_count"] = float(len(artifacts))
+    diagnostics["local_image_count"] = float(len(local_items))
+    for item in local_items:
+        setattr(item.req_state, "mm_sidecar_last_fetch_profile_ms", diagnostics)
+    return pixel_tensors, diagnostics
+
+
+def _run_dp_sharded_mrope_vision_model_with_sidecar(
+    vision_model: Any,
+    pixel_values: Any,
+    grid_thw_list: list[list[int]],
+    *,
+    rope_type: str,
+    context_items: tuple[VitDpShardFetchItem, ...],
+    context: VitDpShardFetchContext,
+    vision_module: Any,
+) -> tuple[Any, ...]:
+    import itertools
+    import torch
+
+    from vllm.distributed import tensor_model_parallel_all_gather
+
+    role = context.role
+    tp_size = role.world_size
+    tp_rank_local = role.local_rank
+
+    patches_per_image = [math.prod(grid_thw) for grid_thw in grid_thw_list]
+    image_to_tp_rank, gpu_sample_counts, grouped_pixel_values_len = (
+        vision_module.get_load_balance_assignment(patches_per_image, tp_size)
+    )
+    cum_gpu_sample_counts = [0, *itertools.accumulate(gpu_sample_counts)]
+    image_idxs_local = image_to_tp_rank[
+        cum_gpu_sample_counts[tp_rank_local] : cum_gpu_sample_counts[tp_rank_local + 1]
+    ]
+
+    pixel_tensors, diagnostics = _fetch_vit_dp_shard_pixel_values(
+        context_items,
+        image_idxs_local,
+        role=role,
+        reference_pixel_values=pixel_values,
+    )
+    if pixel_tensors:
+        pixel_values_local = torch.cat(pixel_tensors, dim=0)
+    else:
+        pixel_values_local = torch.empty(
+            (0, pixel_values.shape[1]),
+            device=pixel_values.device,
+            dtype=pixel_values.dtype,
+        )
+
+    if rope_type == "rope_2d":
+        embed_dim_reduction_factor = (
+            vision_model.merge_kernel_size[0] * vision_model.merge_kernel_size[1]
+        )
+    else:
+        embed_dim_reduction_factor = (
+            vision_model.spatial_merge_size * vision_model.spatial_merge_size
+        )
+
+    max_len_per_rank = max(grouped_pixel_values_len) // embed_dim_reduction_factor
+    local_grid_thw_list = [grid_thw_list[i] for i in image_idxs_local]
+
+    if rope_type == "rope_2d":
+        if pixel_values_local.shape[0] > 0:
+            image_embeds_local = vision_model(
+                pixel_values_local,
+                torch.tensor(local_grid_thw_list),
+            )
+            if isinstance(image_embeds_local, list):
+                image_embeds_local = torch.cat(image_embeds_local, dim=0)
+        else:
+            out_dim = getattr(vision_model.config, "hidden_size", None)
+            image_embeds_local = torch.empty(
+                (0, embed_dim_reduction_factor, out_dim),
+                device=pixel_values.device,
+                dtype=pixel_values.dtype,
+            )
+    else:
+        if pixel_values_local.shape[0] > 0:
+            image_embeds_local = vision_model(pixel_values_local, local_grid_thw_list)
+        else:
+            image_embeds_local = torch.empty(
+                (0, vision_model.out_hidden_size),
+                device=pixel_values.device,
+                dtype=pixel_values.dtype,
+            )
+
+    current_len = image_embeds_local.shape[0]
+    if current_len < max_len_per_rank:
+        padding_size = max_len_per_rank - current_len
+        if rope_type == "rope_2d":
+            padding = torch.empty(
+                (
+                    padding_size,
+                    image_embeds_local.shape[1],
+                    image_embeds_local.shape[2],
+                ),
+                dtype=image_embeds_local.dtype,
+                device=image_embeds_local.device,
+            )
+        else:
+            padding = torch.empty(
+                (padding_size, image_embeds_local.shape[1]),
+                dtype=image_embeds_local.dtype,
+                device=image_embeds_local.device,
+            )
+        image_embeds_local_padded = torch.cat([image_embeds_local, padding], dim=0)
+    else:
+        image_embeds_local_padded = image_embeds_local
+
+    gathered_embeds = tensor_model_parallel_all_gather(
+        image_embeds_local_padded,
+        dim=0,
+    )
+
+    rank_embeddings = list[Any]()
+    for rank in range(tp_size):
+        start_idx = rank * max_len_per_rank
+        end_idx = start_idx + (
+            grouped_pixel_values_len[rank] // embed_dim_reduction_factor
+        )
+        rank_embeddings.append(gathered_embeds[start_idx:end_idx])
+
+    patches_per_output_image = [
+        patch_size // embed_dim_reduction_factor
+        for patch_size in patches_per_image
+    ]
+    original_order_embeddings: list[Any | None] = [None] * len(grid_thw_list)
+    current_idx = 0
+    for rank in range(tp_size):
+        count = gpu_sample_counts[rank]
+        if count > 0:
+            rank_images = image_to_tp_rank[current_idx : current_idx + count]
+            rank_embed = rank_embeddings[rank]
+            embed_start = 0
+            for img_idx in rank_images:
+                img_patches = patches_per_output_image[img_idx]
+                original_order_embeddings[img_idx] = rank_embed[
+                    embed_start : embed_start + img_patches
+                ]
+                embed_start += img_patches
+            current_idx += count
+
+    out_embeddings = tuple(
+        embed for embed in original_order_embeddings if embed is not None
+    )
+    if len(out_embeddings) != len(original_order_embeddings):
+        raise RuntimeError("vit dp shard fetch found unassigned embeddings")
+
+    setattr(context.model_runner, "mm_sidecar_last_fetch_profile_ms", diagnostics)
+    setattr(
+        context.model_runner,
+        "mm_sidecar_last_vit_dp_shard_fetch",
+        {
+            "rank": role.local_rank,
+            "world_size": role.world_size,
+            "local_indices": tuple(int(index) for index in image_idxs_local),
+            "total_images": len(grid_thw_list),
+            "payload_bytes": diagnostics.get("payload_bytes", 0.0),
+        },
+    )
+    _emit_worker_debug(
+        "vit_dp_shard_fetch "
+        f"rank={role.local_rank}/{role.world_size} "
+        f"local_indices={list(image_idxs_local)} "
+        f"total_images={len(grid_thw_list)} "
+        f"payload_bytes={diagnostics.get('payload_bytes', 0.0):.0f}"
+    )
+    return out_embeddings
+
+
+def install_vit_dp_shard_fetch_patch() -> bool:
+    try:
+        vision_module = importlib.import_module("vllm.model_executor.models.vision")
+    except Exception:
+        return False
+    original = getattr(vision_module, "run_dp_sharded_mrope_vision_model", None)
+    if original is None:
+        return False
+    if getattr(original, _VISION_PATCH_MARKER_ATTR, False):
+        return False
+
+    @wraps(original)
+    def wrapped_run_dp_sharded_mrope_vision_model(
+        vision_model: Any,
+        pixel_values: Any,
+        grid_thw_list: list[list[int]],
+        *,
+        rope_type: str,
+    ) -> tuple[Any, ...]:
+        if not _vit_dp_shard_fetch_enabled() or _vit_dp_direct_encode_enabled():
+            return original(
+                vision_model,
+                pixel_values,
+                grid_thw_list,
+                rope_type=rope_type,
+            )
+        context = getattr(vision_model, _VIT_DP_SHARD_CONTEXT_ATTR, None)
+        if not isinstance(context, VitDpShardFetchContext):
+            return original(
+                vision_model,
+                pixel_values,
+                grid_thw_list,
+                rope_type=rope_type,
+            )
+        context_items = _context_slice_for_grid_thw(context, grid_thw_list)
+        if context_items is None:
+            return original(
+                vision_model,
+                pixel_values,
+                grid_thw_list,
+                rope_type=rope_type,
+            )
+        return _run_dp_sharded_mrope_vision_model_with_sidecar(
+            vision_model,
+            pixel_values,
+            grid_thw_list,
+            rope_type=rope_type,
+            context_items=context_items,
+            context=context,
+            vision_module=vision_module,
+        )
+
+    setattr(wrapped_run_dp_sharded_mrope_vision_model, _VISION_PATCH_MARKER_ATTR, True)
+    setattr(wrapped_run_dp_sharded_mrope_vision_model, _VISION_ORIGINAL_FN_ATTR, original)
+    vision_module.run_dp_sharded_mrope_vision_model = (
+        wrapped_run_dp_sharded_mrope_vision_model
+    )
+
+    for module_name in (
+        "vllm.model_executor.models.qwen2_vl",
+        "vllm.model_executor.models.qwen2_5_vl",
+        "vllm.model_executor.models.qwen3_vl",
+    ):
+        module = sys.modules.get(module_name)
+        if module is None:
+            continue
+        if hasattr(module, "run_dp_sharded_mrope_vision_model"):
+            setattr(
+                module,
+                "run_dp_sharded_mrope_vision_model",
+                wrapped_run_dp_sharded_mrope_vision_model,
+            )
+
+    _emit_worker_debug("installed ViT-DP shard fetch vision patch")
+    return True
+
+
 def _manual_encode_and_gather_local_items(
     model_runner: Any,
     *,
@@ -1785,6 +2324,27 @@ def try_replace_scheduled_mm_inputs_from_sidecar(
         model_runner,
         role,
     )
+    vit_dp_shard_fetch_items = _collect_vit_dp_shard_fetch_items(
+        model_runner,
+        scheduler_output,
+        role=role,
+    )
+    vit_dp_shard_fetch_req_ids: set[str] = set()
+    if vit_dp_shard_fetch_items:
+        _materialize_vit_dp_shard_fetch_placeholders(vit_dp_shard_fetch_items)
+        vit_dp_shard_fetch_req_ids = {
+            item.req_id for item in vit_dp_shard_fetch_items
+        }
+        setattr(
+            model_runner,
+            "mm_sidecar_last_vit_dp_shard_fetch_prepared_count",
+            len(vit_dp_shard_fetch_items),
+        )
+        _emit_worker_debug(
+            "prepare vit_dp_shard_fetch "
+            f"items={len(vit_dp_shard_fetch_items)} "
+            f"reqs={sorted(vit_dp_shard_fetch_req_ids)}"
+        )
     for req_id in scheduled_encoder_inputs:
         req_state = requests.get(req_id)
         if req_state is None:
@@ -1800,6 +2360,9 @@ def try_replace_scheduled_mm_inputs_from_sidecar(
             and _vit_dp_direct_encode_enabled()
         ):
             setattr(req_state, "mm_sidecar_vit_dp_prepared", True)
+            continue
+        if str(req_id) in vit_dp_shard_fetch_req_ids:
+            setattr(req_state, "mm_sidecar_vit_dp_shard_fetch_prepared", True)
             continue
         selection = _select_worker_mm_shard(
             model_runner,
@@ -2062,7 +2625,11 @@ def install_gpu_model_runner_patch(gpu_model_runner_cls: Any) -> bool:
                     return original_execute_mm_encoder(self, scheduler_output)
                 finally:
                     scheduler_output.scheduled_encoder_inputs = original_scheduled
-            return original_execute_mm_encoder(self, scheduler_output)
+            restored = _attach_vit_dp_shard_fetch_context(self, scheduler_output)
+            try:
+                return original_execute_mm_encoder(self, scheduler_output)
+            finally:
+                _restore_patched_attrs(restored)
 
     if original_gather_mm_embeddings is not None:
         @wraps(original_gather_mm_embeddings)
