@@ -1644,6 +1644,36 @@ class VllmPatchWorkerSidecarTests(unittest.TestCase):
         ):
             self.assertEqual(FakeGPUModelRunner()._execute_mm_encoder(scheduler_output), [])
 
+    def test_execute_mm_encoder_wrapper_returns_empty_for_shard_fetch_direct_cache(self) -> None:
+        class FakeGPUModelRunner:
+            def _update_states(self, scheduler_output):
+                return None
+
+            def _batch_mm_inputs_from_scheduler(self, scheduler_output):
+                return None
+
+            def _execute_mm_encoder(self, scheduler_output):
+                raise AssertionError("stock encoder should not zip shard-fetch outputs")
+
+        self.assertTrue(install_gpu_model_runner_patch(FakeGPUModelRunner))
+        scheduler_output = SimpleNamespace(
+            scheduled_new_reqs=(),
+            scheduled_encoder_inputs={"req-shard-direct": [0, 1]},
+        )
+        result = VitDpDirectEncodeResult(
+            handled_request_ids=("req-shard-direct",),
+            fallback_scheduled={},
+        )
+
+        with mock.patch(
+            "mm_sidecar.integrations.vllm_patch.worker_sidecar.prepare_scheduled_mm_inputs_before_encoder",
+            return_value=0,
+        ), mock.patch(
+            "mm_sidecar.integrations.vllm_patch.worker_sidecar._try_execute_vit_dp_sidecar_direct_encode",
+            return_value=result,
+        ):
+            self.assertEqual(FakeGPUModelRunner()._execute_mm_encoder(scheduler_output), [])
+
     def test_shard_fetch_gate_direct_writes_encoder_cache(self) -> None:
         plan = SimpleNamespace(
             image_features=(
