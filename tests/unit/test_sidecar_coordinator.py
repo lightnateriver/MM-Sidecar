@@ -172,6 +172,42 @@ class SidecarCoordinatorTests(unittest.TestCase):
             self.assertEqual(batch.source_plan.entries[0].decision, SourcePlanDecision.USE_SIDECAR)
             manager.close()
 
+    def test_fetch_according_to_plan_uses_single_fetch_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            image_paths = [
+                Path(tmpdir) / "ready-default-0.jpg",
+                Path(tmpdir) / "ready-default-1.jpg",
+            ]
+            for image_path in image_paths:
+                image_path.write_bytes(_make_jpeg_bytes())
+
+            manager = _BatchCountingSidecarManager()
+            descriptors = [
+                _make_descriptor(image_path, "req-ready-default", index)
+                for index, image_path in enumerate(image_paths)
+            ]
+            handles = manager.prepare(descriptors)
+            snapshots = manager.wait_for_states(handles, {SidecarState.READY}, 500.0)
+            self.assertEqual([snapshot.state for snapshot in snapshots], [SidecarState.READY] * 2)
+
+            coordinator = SidecarFallbackCoordinator(
+                manager=manager,
+                claimer_id="rank-0",
+                producer_rank=0,
+                near_ready_wait_ms=0.0,
+            )
+            batch = coordinator.fetch_according_to_plan(
+                descriptors=descriptors,
+                handles=list(handles),
+            )
+
+            self.assertEqual(manager.fetch_ready_calls, 2)
+            self.assertEqual(
+                [artifact.handle.request_media_index for artifact in batch.sidecar_artifacts],
+                [0, 1],
+            )
+            manager.close()
+
     def test_fetch_according_to_plan_batches_ready_sidecar_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             image_paths = [
@@ -195,6 +231,7 @@ class SidecarCoordinatorTests(unittest.TestCase):
                 claimer_id="rank-0",
                 producer_rank=0,
                 near_ready_wait_ms=0.0,
+                batch_fetch_ready=True,
             )
             batch = coordinator.fetch_according_to_plan(
                 descriptors=descriptors,

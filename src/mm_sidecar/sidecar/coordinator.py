@@ -83,6 +83,7 @@ class SidecarFallbackCoordinator:
         poll_interval_ms: float = 1.0,
         fallback_wait_ms: float = 1_000.0,
         observe_plan_wait_ms: float = 50.0,
+        batch_fetch_ready: bool = False,
     ) -> None:
         self._manager = manager
         self._claimer_id = claimer_id
@@ -91,6 +92,7 @@ class SidecarFallbackCoordinator:
         self._poll_interval_ms = poll_interval_ms
         self._fallback_wait_ms = fallback_wait_ms
         self._observe_plan_wait_ms = observe_plan_wait_ms
+        self._batch_fetch_ready = batch_fetch_ready
 
     def build_source_plan(
         self,
@@ -321,7 +323,7 @@ class SidecarFallbackCoordinator:
             handles.append(entry.handle)
 
         batch_fetch = getattr(self._manager, "fetch_ready_batch", None)
-        if callable(batch_fetch):
+        if self._batch_fetch_ready and callable(batch_fetch):
             artifacts = tuple(batch_fetch(handles))
         else:
             artifacts = tuple(self._manager.fetch_ready(handle) for handle in handles)

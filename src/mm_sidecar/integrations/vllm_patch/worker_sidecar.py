@@ -157,6 +157,11 @@ def _vit_dp_shard_fetch_enabled() -> bool:
     return value in {"1", "true", "yes", "on"}
 
 
+def _batch_fetch_ready_enabled() -> bool:
+    value = os.getenv("MM_SIDECAR_ENABLE_BATCH_FETCH_READY", "0").strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
+
 def _native_vit_dp_full_replacement_mode(
     model_runner: Any,
     role: TpWorkerRole,
@@ -1293,6 +1298,7 @@ def build_worker_source_plan(
         poll_interval_ms=poll_interval_ms,
         fallback_wait_ms=_remote_fallback_wait_ms(),
         observe_plan_wait_ms=_peer_plan_wait_ms(),
+        batch_fetch_ready=_batch_fetch_ready_enabled(),
     )
 
     if client is None or not binding.enabled:
@@ -1746,6 +1752,7 @@ def _build_vit_dp_execution_plan_for_request(
             poll_interval_ms=1.0,
             fallback_wait_ms=_remote_fallback_wait_ms(),
             observe_plan_wait_ms=_peer_plan_wait_ms(),
+            batch_fetch_ready=_batch_fetch_ready_enabled(),
         )
         if client is None or not binding.enabled:
             source_plan = coordinator.preview_source_plan(
@@ -1852,6 +1859,7 @@ def _sidecar_or_fallback_items_for_plan(
         poll_interval_ms=1.0,
         fallback_wait_ms=_remote_fallback_wait_ms(),
         observe_plan_wait_ms=_peer_plan_wait_ms(),
+        batch_fetch_ready=_batch_fetch_ready_enabled(),
     )
     fetch_start = time.perf_counter()
     fetch_batch = coordinator.fetch_according_to_plan(
@@ -2013,6 +2021,7 @@ def _fetch_vit_dp_shard_pixel_values(
             poll_interval_ms=1.0,
             fallback_wait_ms=_remote_fallback_wait_ms(),
             observe_plan_wait_ms=_peer_plan_wait_ms(),
+            batch_fetch_ready=_batch_fetch_ready_enabled(),
         )
         source_plan_start = time.perf_counter()
         source_plan = coordinator.build_source_plan(
@@ -2813,6 +2822,7 @@ def try_replace_scheduled_mm_inputs_from_sidecar(
                 poll_interval_ms=1.0,
                 fallback_wait_ms=_remote_fallback_wait_ms(),
                 observe_plan_wait_ms=_peer_plan_wait_ms(),
+                batch_fetch_ready=_batch_fetch_ready_enabled(),
             )
             plan_start = time.perf_counter()
             if native_vit_dp_full_replacement:
