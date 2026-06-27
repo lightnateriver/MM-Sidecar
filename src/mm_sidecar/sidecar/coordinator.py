@@ -37,7 +37,6 @@ class SourcePlan:
     near_ready_wait_ms: float
     used_fail_open: bool
     running_ready_wait_ms: float = 0.0
-    final_status_check_ms: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,8 +86,6 @@ class SidecarFallbackCoordinator:
         observe_plan_wait_ms: float = 50.0,
         batch_fetch_ready: bool = False,
         running_ready_wait_ms: float = 0.0,
-        running_ready_wait_by_transport_ms: dict[str, float] | None = None,
-        final_status_check_before_claim: bool = True,
     ) -> None:
         self._manager = manager
         self._claimer_id = claimer_id
@@ -99,44 +96,6 @@ class SidecarFallbackCoordinator:
         self._observe_plan_wait_ms = observe_plan_wait_ms
         self._batch_fetch_ready = batch_fetch_ready
         self._running_ready_wait_ms = running_ready_wait_ms
-        self._running_ready_wait_by_transport_ms = dict(
-            running_ready_wait_by_transport_ms or {}
-        )
-        self._final_status_check_before_claim = final_status_check_before_claim
-
-    def _running_wait_budget_ms(self, descriptor: FallbackDescriptor) -> float:
-        if self._running_ready_wait_ms > 0.0:
-            return self._running_ready_wait_ms
-        transport = getattr(
-            getattr(descriptor.captured_image, "source_ref", None),
-            "transport",
-            None,
-        )
-        transport_key = str(getattr(transport, "value", transport) or "").strip()
-        if not transport_key:
-            return 0.0
-        try:
-            return max(
-                0.0,
-                float(self._running_ready_wait_by_transport_ms.get(transport_key, 0.0)),
-            )
-        except (TypeError, ValueError):
-            return 0.0
-
-    def _fallback_claim_reason(self, snapshot: SidecarStatusSnapshot | None) -> str:
-        if snapshot is None:
-            return "absent_fallback_claim_granted"
-        if snapshot.state is SidecarState.SIDECAR_RUNNING:
-            return "running_timeout_fallback_claim_granted"
-        if snapshot.state is SidecarState.QUEUED:
-            return "queued_timeout_fallback_claim_granted"
-        if snapshot.state is SidecarState.FAILED:
-            return "failed_fallback_claim_granted"
-        if snapshot.state is SidecarState.EXPIRED:
-            return "expired_fallback_claim_granted"
-        if snapshot.state is SidecarState.ABSENT:
-            return "absent_fallback_claim_granted"
-        return "fallback_claim_granted"
 
     def build_source_plan(
         self,
@@ -169,7 +128,6 @@ class SidecarFallbackCoordinator:
 
         waited_ms = 0.0
         running_waited_ms = 0.0
-        final_status_check_ms = 0.0
         final = initial
         if wait_for_ready and unresolved_indexes and self._near_ready_wait_ms > 0.0:
             wait_start = _now_ms()
@@ -188,77 +146,37 @@ class SidecarFallbackCoordinator:
                 time.sleep(self._poll_interval_ms / 1000.0)
             waited_ms = max(0.0, _now_ms() - wait_start)
 
-        descriptor_by_index = {
-            descriptor.request_media_index: descriptor for descriptor in descriptors
+        running_indexes = {
+            snapshot.handle.request_media_index
+            for snapshot in final
+            if snapshot.state is SidecarState.SIDECAR_RUNNING
         }
-        running_deadlines_by_index: dict[int, float] = {}
-        running_wait_start_ms = _now_ms()
-        for snapshot in final:
-            if snapshot.state is not SidecarState.SIDECAR_RUNNING:
-                continue
-            descriptor = descriptor_by_index.get(snapshot.handle.request_media_index)
-            if descriptor is None:
-                continue
-            budget_ms = self._running_wait_budget_ms(descriptor)
-            if budget_ms > 0.0:
-                running_deadlines_by_index[snapshot.handle.request_media_index] = (
-                    running_wait_start_ms + budget_ms
-                )
         if (
             claim
             and wait_for_ready
-            and running_deadlines_by_index
+            and running_indexes
+            and self._running_ready_wait_ms > 0.0
         ):
-            wait_start = running_wait_start_ms
+            wait_start = _now_ms()
+            deadline = wait_start + self._running_ready_wait_ms
+            tracked_running_indexes = set(running_indexes)
             while True:
                 final = self._manager.batch_get_status(handles)
-                now_ms = _now_ms()
-                waiting_indexes = set[int]()
-                next_deadline_ms: float | None = None
-                for snapshot in final:
-                    media_index = snapshot.handle.request_media_index
-                    deadline_ms = running_deadlines_by_index.get(media_index)
-                    if deadline_ms is None:
-                        continue
-                    if snapshot.state is not SidecarState.SIDECAR_RUNNING:
-                        continue
-                    if now_ms >= deadline_ms:
-                        continue
-                    waiting_indexes.add(media_index)
-                    if next_deadline_ms is None or deadline_ms < next_deadline_ms:
-                        next_deadline_ms = deadline_ms
-                if not waiting_indexes:
-                    break
-                if next_deadline_ms is None:
-                    break
-                sleep_ms = min(
-                    self._poll_interval_ms,
-                    max(0.0, next_deadline_ms - now_ms),
-                )
-                if sleep_ms <= 0.0:
-                    break
-                time.sleep(sleep_ms / 1000.0)
-            running_waited_ms = max(0.0, _now_ms() - wait_start)
-
-        ready_after_final_check_indexes: set[int] = set()
-        if claim and self._final_status_check_before_claim:
-            pre_check_not_ready = {
-                snapshot.handle.request_media_index
-                for snapshot in final
-                if snapshot.state is not SidecarState.READY
-            }
-            if pre_check_not_ready:
-                final_check_start = _now_ms()
-                final = self._manager.batch_get_status(handles)
-                final_status_check_ms = max(0.0, _now_ms() - final_check_start)
-                ready_after_final_check_indexes = {
+                running_indexes = {
                     snapshot.handle.request_media_index
                     for snapshot in final
                     if (
-                        snapshot.handle.request_media_index in pre_check_not_ready
-                        and snapshot.state is SidecarState.READY
+                        snapshot.handle.request_media_index
+                        in tracked_running_indexes
+                        and snapshot.state is SidecarState.SIDECAR_RUNNING
                     )
                 }
+                if not running_indexes:
+                    break
+                if _now_ms() >= deadline:
+                    break
+                time.sleep(self._poll_interval_ms / 1000.0)
+            running_waited_ms = max(0.0, _now_ms() - wait_start)
 
         claim_targets = [
             snapshot.handle
@@ -279,18 +197,13 @@ class SidecarFallbackCoordinator:
         for descriptor, handle in zip(descriptors, handles):
             snapshot = snapshot_by_index.get(handle.request_media_index)
             if snapshot is not None and snapshot.state is SidecarState.READY:
-                ready_reason = (
-                    "ready_after_final_status_check"
-                    if handle.request_media_index in ready_after_final_check_indexes
-                    else "ready_before_fallback"
-                )
                 entries.append(
                     SourcePlanEntry(
                         request_media_index=handle.request_media_index,
                         decision=SourcePlanDecision.USE_SIDECAR,
                         handle=handle,
                         state=snapshot.state,
-                        reason=ready_reason,
+                        reason="ready_before_fallback",
                     )
                 )
                 continue
@@ -304,7 +217,7 @@ class SidecarFallbackCoordinator:
                         producer_rank=self._producer_rank,
                         handle=claim_result.handle,
                         state=snapshot.state if snapshot is not None else SidecarState.ABSENT,
-                        reason=self._fallback_claim_reason(snapshot),
+                        reason="fallback_claim_granted",
                     )
                 )
                 continue
@@ -375,7 +288,6 @@ class SidecarFallbackCoordinator:
             near_ready_wait_ms=waited_ms,
             used_fail_open=False,
             running_ready_wait_ms=running_waited_ms,
-            final_status_check_ms=final_status_check_ms,
         )
 
     def fetch_according_to_plan(
