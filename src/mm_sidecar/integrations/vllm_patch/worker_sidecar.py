@@ -115,6 +115,12 @@ class VitDpShardFetchContext:
     cursor: int = 0
 
 
+class _DeferVitDpShardFetchToVisionPatch(RuntimeError):
+    def __init__(self, message: str, diagnostics: dict[str, float]) -> None:
+        super().__init__(message)
+        self.diagnostics = diagnostics
+
+
 _CLIENT_UNSET = object()
 _CLIENT_LOCK = Lock()
 _CLIENT_CACHE: Any | None | object = _CLIENT_UNSET
@@ -279,9 +285,21 @@ def _native_vit_dp_ready_wait_ms() -> float:
 
 
 def _vit_dp_direct_cache_ready_wait_ms() -> float:
-    if _vit_dp_shard_fetch_enabled() and not _vit_dp_direct_encode_enabled():
-        return _native_vit_dp_ready_wait_ms()
-    return 2.0
+    raw = os.getenv("MM_SIDECAR_VIT_DP_DIRECT_CACHE_READY_WAIT_MS")
+    if raw is None or not raw.strip():
+        return 2.0
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return 2.0
+
+
+def _defer_vit_dp_direct_cache_on_fallback_enabled() -> bool:
+    value = os.getenv(
+        "MM_SIDECAR_DEFER_VIT_DP_DIRECT_CACHE_ON_FALLBACK",
+        "1",
+    ).strip().lower()
+    return value not in {"0", "false", "no", "off"}
 
 
 def _mode_is_data(value: Any) -> bool:
@@ -1859,6 +1877,16 @@ def _sidecar_or_fallback_items_for_plan(
             f"entries={_source_plan_entries_debug(fetch_batch.source_plan)}"
         )
     if fetch_batch.fallback_descriptors:
+        if (
+            _defer_vit_dp_direct_cache_on_fallback_enabled()
+            and _vit_dp_shard_fetch_enabled()
+            and not _vit_dp_direct_encode_enabled()
+        ):
+            raise _DeferVitDpShardFetchToVisionPatch(
+                "direct-cache source plan needs local fallback for "
+                f"media indexes {list(fallback_indexes)}",
+                diagnostics,
+            )
         if _worker_fetch_profile_enabled():
             _emit_worker_debug(
                 "direct_cache_fallback "
@@ -2523,6 +2551,8 @@ def _try_execute_vit_dp_sidecar_direct_encode(
                     ready = True
             except Exception as exc:
                 error = exc
+                if isinstance(exc, _DeferVitDpShardFetchToVisionPatch):
+                    diagnostics = dict(exc.diagnostics)
 
         barrier_start = time.perf_counter()
         all_ready = _all_tp_ranks_ready_for_direct_encode(ready, role=role)
@@ -2537,12 +2567,19 @@ def _try_execute_vit_dp_sidecar_direct_encode(
         if not all_ready or plan is None:
             if shard_fetch_direct_requested:
                 if error is not None:
-                    _append_runner_error(
-                        model_runner,
-                        "vit dp shard-fetch direct cache write deferred to "
-                        "vision patch for "
-                        f"{req_id}: {error.__class__.__name__}: {error}",
-                    )
+                    if isinstance(error, _DeferVitDpShardFetchToVisionPatch):
+                        _emit_worker_debug(
+                            "vit dp shard-fetch direct cache write deferred to "
+                            "vision patch for "
+                            f"{req_id}: {error}"
+                        )
+                    else:
+                        _append_runner_error(
+                            model_runner,
+                            "vit dp shard-fetch direct cache write deferred to "
+                            "vision patch for "
+                            f"{req_id}: {error.__class__.__name__}: {error}",
+                        )
                 _emit_worker_debug(
                     f"req={req_id} shard_fetch_direct_defer "
                     f"rank={role.local_rank}/{role.world_size} "

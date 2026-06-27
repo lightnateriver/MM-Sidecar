@@ -24,6 +24,7 @@ from mm_sidecar.integrations.vllm_patch.worker_sidecar import (
     VitDpShardFetchItem,
     _all_tp_ranks_ready_for_direct_encode,
     _build_vit_dp_execution_plan_for_request,
+    _DeferVitDpShardFetchToVisionPatch,
     _load_balance_assignment,
     _manual_encode_and_gather_local_items,
     _run_dp_sharded_mrope_vision_model_with_sidecar,
@@ -1809,13 +1810,77 @@ class VllmPatchWorkerSidecarTests(unittest.TestCase):
         self.assertIsNone(result)
         self.assertEqual(runner.encoder_cache, {})
 
-    def test_vit_dp_direct_cache_ready_wait_uses_shard_fetch_wait(self) -> None:
+    def test_shard_fetch_direct_cache_fallback_defers_without_error(self) -> None:
+        req_state = SimpleNamespace()
+        runner = SimpleNamespace(
+            requests={"req-shard-fallback-defer": req_state},
+            model=SimpleNamespace(use_data_parallel=True),
+            encoder_cache={},
+        )
+        scheduler_output = SimpleNamespace(
+            scheduled_encoder_inputs={"req-shard-fallback-defer": [0]},
+        )
+        plan = SimpleNamespace(
+            binding=SimpleNamespace(request_id="req-shard-fallback-defer"),
+            image_features=(SimpleNamespace(identifier="img-a"),),
+            local_indices=(0,),
+            order=(0,),
+            counts=(1, 0),
+        )
+        defer_error = _DeferVitDpShardFetchToVisionPatch(
+            "needs local fallback",
+            {"source_plan_fallback_count": 1.0},
+        )
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                "MM_SIDECAR_ENABLE_VIT_DP_DIRECT_ENCODE": "0",
+                "MM_SIDECAR_ENABLE_VIT_DP_SHARD_FETCH": "1",
+            },
+        ), mock.patch(
+            "mm_sidecar.integrations.vllm_patch.worker_sidecar._uses_vit_data_parallel",
+            return_value=True,
+        ), mock.patch(
+            "mm_sidecar.integrations.vllm_patch.worker_sidecar._resolve_tp_worker_role",
+            return_value=TpWorkerRole(
+                local_rank=0,
+                world_size=2,
+                coordinator_rank=0,
+                is_coordinator=True,
+            ),
+        ), mock.patch(
+            "mm_sidecar.integrations.vllm_patch.worker_sidecar._build_vit_dp_execution_plan_for_request",
+            return_value=plan,
+        ), mock.patch(
+            "mm_sidecar.integrations.vllm_patch.worker_sidecar._sidecar_or_fallback_items_for_plan",
+            side_effect=defer_error,
+        ), mock.patch(
+            "mm_sidecar.integrations.vllm_patch.worker_sidecar._all_tp_ranks_ready_for_direct_encode",
+            return_value=False,
+        ), mock.patch(
+            "mm_sidecar.integrations.vllm_patch.worker_sidecar._manual_encode_and_gather_local_items",
+            side_effect=AssertionError("should defer before manual encode"),
+        ):
+            result = _try_execute_vit_dp_sidecar_direct_encode(
+                runner,
+                scheduler_output,
+            )
+
+        self.assertIsNone(result)
+        self.assertFalse(hasattr(runner, "mm_sidecar_worker_errors"))
+        self.assertEqual(
+            req_state.mm_sidecar_last_fetch_profile_ms["source_plan_fallback_count"],
+            1.0,
+        )
+
+    def test_vit_dp_direct_cache_ready_wait_uses_direct_cache_env(self) -> None:
         with mock.patch.dict(
             os.environ,
             {
                 "MM_SIDECAR_ENABLE_VIT_DP_SHARD_FETCH": "1",
                 "MM_SIDECAR_ENABLE_VIT_DP_DIRECT_ENCODE": "0",
-                "MM_SIDECAR_NATIVE_VIT_DP_READY_WAIT_MS": "37",
+                "MM_SIDECAR_VIT_DP_DIRECT_CACHE_READY_WAIT_MS": "37",
             },
         ):
             self.assertEqual(_vit_dp_direct_cache_ready_wait_ms(), 37.0)
@@ -1825,9 +1890,12 @@ class VllmPatchWorkerSidecarTests(unittest.TestCase):
             {
                 "MM_SIDECAR_ENABLE_VIT_DP_SHARD_FETCH": "1",
                 "MM_SIDECAR_ENABLE_VIT_DP_DIRECT_ENCODE": "1",
-                "MM_SIDECAR_NATIVE_VIT_DP_READY_WAIT_MS": "37",
+                "MM_SIDECAR_VIT_DP_DIRECT_CACHE_READY_WAIT_MS": "37",
             },
         ):
+            self.assertEqual(_vit_dp_direct_cache_ready_wait_ms(), 37.0)
+
+        with mock.patch.dict(os.environ, {}, clear=True):
             self.assertEqual(_vit_dp_direct_cache_ready_wait_ms(), 2.0)
 
     def test_source_plan_debug_diagnostics_counts_reasons(self) -> None:
