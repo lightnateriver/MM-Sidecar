@@ -477,6 +477,100 @@ This means "optimization merged" and "performance fully reproduced" are not yet 
 The remaining gap is not on the API-side metadata wait path anymore; it is elsewhere in the request critical path.
 ```
 
+## TP2 ViT-DP Direct-Cache Shard Fetch Validation On CUDA
+
+After the TP2 ViT-DP shard-fetch path showed possible multi-image color drift, the
+worker patch was changed so `MM_SIDECAR_ENABLE_VIT_DP_SHARD_FETCH=1` writes encoder
+outputs directly into `encoder_cache` by `feature.identifier`. This mirrors the
+safe alignment pattern used by the earlier direct-encode experiment and avoids
+returning shard-fetched outputs to the stock `_execute_mm_encoder()` zip path.
+
+Code commits:
+
+```text
+c25479d fix: direct-cache vit-dp shard fetch outputs
+d87f4b5 test: guard shard-fetch direct cache wrapper
+```
+
+Remote CUDA validation used 2x RTX 4090D with:
+
+```text
+model: /autodl-fs/data/qwen3.5-0.8b
+TP: 2
+ViT-DP: --mm-encoder-tp-mode data
+serving mode: --enforce-eager
+sidecar workers: 32
+strict protocol: warmup 3 + measured 5, no repeated image paths inside a run
+seed: 2026062701
+```
+
+Artifacts:
+
+```text
+/root/mm-sidecar-e2e/tp2_sidecar_directcache_seed2701_20260627.json
+/root/mm-sidecar-e2e/tp2_sidecar_directcache_seed2701_20260627.md
+/root/mm-sidecar-e2e/tp2_baseline_vitdp_seed2701_20260627.json
+/root/mm-sidecar-e2e/tp2_baseline_vitdp_seed2701_20260627.md
+/root/mm-sidecar-e2e/tp2_sidecar_directcache_vs_baseline_seed2701_20260627.md
+```
+
+Image uniqueness was checked for both runs:
+
+```text
+baseline: 816/816 unique, duplicates=0
+sidecar: 816/816 unique, duplicates=0
+```
+
+Focused replay note:
+
+```text
+The previously suspicious img_0099 13-image case returned "Orange" even as a
+single-image request on the CUDA service, so it is not a valid sidecar ordering
+failure signal on this backend. Multi-image index probes matched single-image
+answers for the first three images.
+```
+
+Same-seed strict comparison:
+
+| transport | images | base TTFT ms | sidecar TTFT ms | delta TTFT ms | speedup | base E2E ms | sidecar E2E ms | delta E2E ms | base semantic | sidecar semantic |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| local_path | 1 | 80.15 | 94.21 | +14.06 | 0.85x | 105.07 | 119.47 | +14.39 | 5/5 | 5/5 |
+| local_path | 13 | 225.38 | 227.27 | +1.89 | 0.99x | 249.05 | 251.14 | +2.09 | 5/5 | 5/5 |
+| local_path | 20 | 411.80 | 335.49 | -76.31 | 1.23x | 436.35 | 452.88 | +16.53 | 5/5 | 3/5 |
+| http | 1 | 78.51 | 94.73 | +16.22 | 0.83x | 103.17 | 119.97 | +16.81 | 5/5 | 5/5 |
+| http | 13 | 1272.30 | 1185.72 | -86.57 | 1.07x | 1294.82 | 1208.95 | -85.87 | 5/5 | 5/5 |
+| http | 20 | 1486.50 | 1359.13 | -127.37 | 1.09x | 1510.61 | 1383.75 | -126.86 | 5/5 | 5/5 |
+| base64 | 1 | 78.50 | 90.21 | +11.71 | 0.87x | 103.26 | 115.21 | +11.94 | 5/5 | 5/5 |
+| base64 | 13 | 232.68 | 194.59 | -38.09 | 1.20x | 255.51 | 217.69 | -37.82 | 5/5 | 5/5 |
+| base64 | 20 | 422.57 | 283.59 | -138.98 | 1.49x | 446.87 | 353.17 | -93.70 | 5/5 | 4/5 |
+
+Loose semantic interpretation:
+
+```text
+Baseline measured semantic: strict 45/45, loose 45/45.
+Sidecar measured semantic: strict 42/45, loose 45/45.
+The three sidecar strict failures all included the expected color word, but the
+model answered in a full sentence instead of a single word. These are output
+contract failures, not observed visual-order failures.
+```
+
+Interpretation:
+
+```text
+The direct-cache shard-fetch path removes the previous suspected multi-image
+ordering risk: 13-image cases are strict clean on all transports, and 20-image
+loose semantics are clean.
+
+The performance profile is mixed by case:
+- 1-image cases are slower because sidecar/direct-cache overhead dominates.
+- 13-image base64 and 20-image base64/http show clear TTFT wins.
+- local_path 20 shows TTFT win but E2E is polluted by longer full-sentence
+  outputs in the sidecar run.
+
+The remaining precision issue is output-contract stability under 20-image
+local_path/base64 sidecar runs, not image payload alignment.
+```
+
 ## Next Engineering Priorities
 
 1. Add request-scoped timestamps around `wait_for_metadata()` and sidecar service RPC boundaries.
