@@ -136,6 +136,10 @@ class SidecarServiceTests(unittest.TestCase):
                 assert artifact.fetch_diagnostics_ms is not None
                 self.assertIn("client_rpc_total", artifact.fetch_diagnostics_ms)
                 self.assertIn("manager_fetch_total", artifact.fetch_diagnostics_ms)
+                self.assertNotIn(
+                    "manager_fetch_batch_count",
+                    artifact.fetch_diagnostics_ms,
+                )
             finally:
                 try:
                     client.shutdown()

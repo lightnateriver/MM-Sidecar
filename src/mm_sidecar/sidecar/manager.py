@@ -225,12 +225,20 @@ class SidecarManager:
             time.sleep(poll_interval_ms / 1000.0)
 
     def fetch_ready(self, handle: SidecarHandle) -> PreparedArtifact | None:
-        artifacts = self.fetch_ready_batch([handle])
+        artifacts = self._fetch_ready_many([handle], record_batch=False)
         return artifacts[0] if artifacts else None
 
     def fetch_ready_batch(
         self,
         handles: list[SidecarHandle] | tuple[SidecarHandle, ...],
+    ) -> tuple[PreparedArtifact | None, ...]:
+        return self._fetch_ready_many(handles, record_batch=len(handles) > 1)
+
+    def _fetch_ready_many(
+        self,
+        handles: list[SidecarHandle] | tuple[SidecarHandle, ...],
+        *,
+        record_batch: bool,
     ) -> tuple[PreparedArtifact | None, ...]:
         fetch_started_ms = _now_ms()
         self._drain_ready_results()
@@ -246,6 +254,7 @@ class SidecarManager:
                     after_ready_drain_ms=after_ready_drain_ms,
                     after_result_drain_ms=after_result_drain_ms,
                     shared_count=shared_count,
+                    record_batch=record_batch,
                 )
                 for handle in handles
             )
@@ -258,6 +267,7 @@ class SidecarManager:
         after_ready_drain_ms: float,
         after_result_drain_ms: float,
         shared_count: int,
+        record_batch: bool,
     ) -> PreparedArtifact | None:
         entry = self._entries.get(handle.cache_key)
         if entry is None:
@@ -311,9 +321,15 @@ class SidecarManager:
                         0.0,
                         _now_ms() - cache_get_finished_ms,
                     ),
-                    "manager_fetch_batch_count": 1.0 / shared_count,
-                    "manager_fetch_batch_items": 1.0,
                     "manager_local_payload": 1.0,
+                    **(
+                        {
+                            "manager_fetch_batch_count": 1.0 / shared_count,
+                            "manager_fetch_batch_items": 1.0,
+                        }
+                        if record_batch
+                        else {}
+                    ),
                 },
             )
         cache_get_started_ms = _now_ms()
@@ -355,8 +371,14 @@ class SidecarManager:
                     0.0,
                     _now_ms() - cache_get_finished_ms,
                 ),
-                "manager_fetch_batch_count": 1.0 / shared_count,
-                "manager_fetch_batch_items": 1.0,
+                **(
+                    {
+                        "manager_fetch_batch_count": 1.0 / shared_count,
+                        "manager_fetch_batch_items": 1.0,
+                    }
+                    if record_batch
+                    else {}
+                ),
             },
         )
 
