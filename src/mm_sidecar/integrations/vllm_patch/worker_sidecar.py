@@ -299,6 +299,16 @@ def _vit_dp_direct_cache_ready_wait_ms() -> float:
         return 2.0
 
 
+def _running_ready_wait_ms() -> float:
+    raw = os.getenv("MM_SIDECAR_RUNNING_READY_WAIT_MS")
+    if raw is None or not raw.strip():
+        return 0.0
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return 0.0
+
+
 def _defer_vit_dp_direct_cache_on_fallback_enabled() -> bool:
     value = os.getenv(
         "MM_SIDECAR_DEFER_VIT_DP_DIRECT_CACHE_ON_FALLBACK",
@@ -871,13 +881,20 @@ def _source_plan_numeric_diagnostics(
         "source_plan_fallback_count": 0.0,
         "source_plan_local_fallback_count": 0.0,
         "source_plan_remote_fallback_count": 0.0,
-        "source_plan_reported_wait_ms": float(
+        "source_plan_near_ready_wait_ms": float(
             getattr(source_plan, "near_ready_wait_ms", 0.0) or 0.0
+        ),
+        "source_plan_running_ready_wait_ms": float(
+            getattr(source_plan, "running_ready_wait_ms", 0.0) or 0.0
         ),
         "source_plan_used_fail_open": (
             1.0 if bool(getattr(source_plan, "used_fail_open", False)) else 0.0
         ),
     }
+    diagnostics["source_plan_reported_wait_ms"] = (
+        diagnostics["source_plan_near_ready_wait_ms"]
+        + diagnostics["source_plan_running_ready_wait_ms"]
+    )
     for entry in entries:
         decision = getattr(entry, "decision", None)
         if decision == SourcePlanDecision.USE_SIDECAR:
@@ -1299,6 +1316,7 @@ def build_worker_source_plan(
         fallback_wait_ms=_remote_fallback_wait_ms(),
         observe_plan_wait_ms=_peer_plan_wait_ms(),
         batch_fetch_ready=_batch_fetch_ready_enabled(),
+        running_ready_wait_ms=_running_ready_wait_ms(),
     )
 
     if client is None or not binding.enabled:
@@ -1753,6 +1771,7 @@ def _build_vit_dp_execution_plan_for_request(
             fallback_wait_ms=_remote_fallback_wait_ms(),
             observe_plan_wait_ms=_peer_plan_wait_ms(),
             batch_fetch_ready=_batch_fetch_ready_enabled(),
+            running_ready_wait_ms=_running_ready_wait_ms(),
         )
         if client is None or not binding.enabled:
             source_plan = coordinator.preview_source_plan(
@@ -1860,6 +1879,7 @@ def _sidecar_or_fallback_items_for_plan(
         fallback_wait_ms=_remote_fallback_wait_ms(),
         observe_plan_wait_ms=_peer_plan_wait_ms(),
         batch_fetch_ready=_batch_fetch_ready_enabled(),
+        running_ready_wait_ms=_running_ready_wait_ms(),
     )
     fetch_start = time.perf_counter()
     fetch_batch = coordinator.fetch_according_to_plan(
@@ -2022,6 +2042,7 @@ def _fetch_vit_dp_shard_pixel_values(
             fallback_wait_ms=_remote_fallback_wait_ms(),
             observe_plan_wait_ms=_peer_plan_wait_ms(),
             batch_fetch_ready=_batch_fetch_ready_enabled(),
+            running_ready_wait_ms=_running_ready_wait_ms(),
         )
         source_plan_start = time.perf_counter()
         source_plan = coordinator.build_source_plan(
@@ -2823,6 +2844,7 @@ def try_replace_scheduled_mm_inputs_from_sidecar(
                 fallback_wait_ms=_remote_fallback_wait_ms(),
                 observe_plan_wait_ms=_peer_plan_wait_ms(),
                 batch_fetch_ready=_batch_fetch_ready_enabled(),
+                running_ready_wait_ms=_running_ready_wait_ms(),
             )
             plan_start = time.perf_counter()
             if native_vit_dp_full_replacement:

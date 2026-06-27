@@ -28,7 +28,12 @@ from mm_sidecar.sidecar import (
 from mm_sidecar.sidecar.coordinator import build_ranked_claimer_id
 from mm_sidecar.sidecar.processor import WorkerResult, WorkerTask
 from mm_sidecar.sidecar.processor import run_descriptor_locally
-from mm_sidecar.sidecar.protocol import FallbackDescriptor
+from mm_sidecar.sidecar.protocol import (
+    FallbackClaimResult,
+    FallbackDescriptor,
+    SidecarHandle,
+    SidecarStatusSnapshot,
+)
 
 
 def _make_jpeg_bytes(size: tuple[int, int] = (288, 512)) -> bytes:
@@ -142,6 +147,54 @@ class _BatchCountingSidecarManager(SidecarManager):
     def fetch_ready(self, handle):
         self.fetch_ready_calls += 1
         return super().fetch_ready(handle)
+
+
+class _SequencedStatusManager:
+    def __init__(
+        self,
+        *,
+        states: list[SidecarState],
+    ) -> None:
+        self.states = list(states)
+        self.batch_get_status_calls = 0
+        self.try_fallback_claim_calls = 0
+
+    def batch_get_status(self, handles):
+        state_index = min(self.batch_get_status_calls, len(self.states) - 1)
+        state = self.states[state_index]
+        self.batch_get_status_calls += 1
+        return tuple(
+            SidecarStatusSnapshot(
+                handle=handle,
+                state=state,
+                epoch=handle.epoch,
+                updated_at_ms=float(self.batch_get_status_calls),
+            )
+            for handle in handles
+        )
+
+    def try_fallback_claim(self, handles, claimer_id):
+        self.try_fallback_claim_calls += 1
+        return tuple(
+            FallbackClaimResult(
+                handle=handle,
+                granted=True,
+                state=SidecarState.FALLBACK_CLAIMED,
+                epoch=handle.epoch,
+                claimed_by=claimer_id,
+                updated_at_ms=10.0,
+            )
+            for handle in handles
+        )
+
+
+def _make_handle(descriptor: FallbackDescriptor) -> SidecarHandle:
+    return SidecarHandle(
+        request_id=descriptor.request_id,
+        request_media_index=descriptor.request_media_index,
+        cache_key=descriptor.cache_key,
+        epoch=1,
+    )
 
 
 class SidecarCoordinatorTests(unittest.TestCase):
@@ -272,6 +325,60 @@ class SidecarCoordinatorTests(unittest.TestCase):
             self.assertEqual(plan.entries[0].producer_rank, 2)
             self.assertEqual(plan.entries[0].reason, "fallback_claim_granted")
             manager.close()
+
+    def test_running_ready_wait_can_avoid_local_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            image_path = Path(tmpdir) / "running-ready.jpg"
+            image_path.write_bytes(_make_jpeg_bytes())
+            descriptor = _make_descriptor(image_path, "req-running-ready", 0)
+            handle = _make_handle(descriptor)
+            manager = _SequencedStatusManager(
+                states=[SidecarState.SIDECAR_RUNNING, SidecarState.READY],
+            )
+
+            coordinator = SidecarFallbackCoordinator(
+                manager=manager,
+                claimer_id="rank-0",
+                producer_rank=0,
+                near_ready_wait_ms=0.0,
+                poll_interval_ms=0.0,
+                running_ready_wait_ms=100.0,
+            )
+            plan = coordinator.build_source_plan(
+                descriptors=[descriptor],
+                handles=[handle],
+            )
+
+            self.assertEqual(plan.entries[0].decision, SourcePlanDecision.USE_SIDECAR)
+            self.assertEqual(manager.try_fallback_claim_calls, 0)
+            self.assertGreaterEqual(plan.running_ready_wait_ms, 0.0)
+            self.assertEqual(manager.batch_get_status_calls, 2)
+
+    def test_running_ready_wait_does_not_wait_for_queued_items(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            image_path = Path(tmpdir) / "queued.jpg"
+            image_path.write_bytes(_make_jpeg_bytes())
+            descriptor = _make_descriptor(image_path, "req-queued", 0)
+            handle = _make_handle(descriptor)
+            manager = _SequencedStatusManager(states=[SidecarState.QUEUED])
+
+            coordinator = SidecarFallbackCoordinator(
+                manager=manager,
+                claimer_id="rank-0",
+                producer_rank=0,
+                near_ready_wait_ms=0.0,
+                poll_interval_ms=0.0,
+                running_ready_wait_ms=100.0,
+            )
+            plan = coordinator.build_source_plan(
+                descriptors=[descriptor],
+                handles=[handle],
+            )
+
+            self.assertEqual(plan.entries[0].decision, SourcePlanDecision.FALLBACK)
+            self.assertEqual(manager.try_fallback_claim_calls, 1)
+            self.assertEqual(plan.running_ready_wait_ms, 0.0)
+            self.assertEqual(manager.batch_get_status_calls, 1)
 
     def test_manager_unavailable_uses_fail_open_plan(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

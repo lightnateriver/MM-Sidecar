@@ -647,6 +647,7 @@ def _serialize_source_plan(plan: SourcePlan) -> dict[str, Any]:
     return {
         "request_id": plan.request_id,
         "near_ready_wait_ms": plan.near_ready_wait_ms,
+        "running_ready_wait_ms": getattr(plan, "running_ready_wait_ms", 0.0),
         "used_fail_open": plan.used_fail_open,
         "entries": [_serialize_source_plan_entry(entry) for entry in plan.entries],
     }

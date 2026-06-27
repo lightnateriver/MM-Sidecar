@@ -1934,6 +1934,7 @@ class VllmPatchWorkerSidecarTests(unittest.TestCase):
                 ),
             ),
             near_ready_wait_ms=3.5,
+            running_ready_wait_ms=4.0,
             used_fail_open=False,
         )
 
@@ -1944,6 +1945,9 @@ class VllmPatchWorkerSidecarTests(unittest.TestCase):
         self.assertEqual(diagnostics["source_plan_fallback_count"], 2.0)
         self.assertEqual(diagnostics["source_plan_local_fallback_count"], 1.0)
         self.assertEqual(diagnostics["source_plan_remote_fallback_count"], 1.0)
+        self.assertEqual(diagnostics["source_plan_near_ready_wait_ms"], 3.5)
+        self.assertEqual(diagnostics["source_plan_running_ready_wait_ms"], 4.0)
+        self.assertEqual(diagnostics["source_plan_reported_wait_ms"], 7.5)
         self.assertEqual(diagnostics["source_plan_state_ready"], 1.0)
         self.assertEqual(diagnostics["source_plan_state_sidecar_running"], 1.0)
         self.assertEqual(
