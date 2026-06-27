@@ -781,3 +781,81 @@ Keep the code as an opt-in diagnostic/experimental path, but keep it disabled by
 default. The next optimization should target payload representation or reducing
 local fallback frequency, not merely reducing the number of fetch_ready RPCs.
 ```
+
+## TP2 `SIDECAR_RUNNING` Wait Experiment
+
+To test whether TP workers were wasting sidecar work by falling back while an
+item was already being processed, an opt-in running-state wait was added.
+
+Implementation commit:
+
+```text
+6a7a977 feat: wait longer for running sidecar artifacts
+```
+
+Runtime switch:
+
+```bash
+MM_SIDECAR_RUNNING_READY_WAIT_MS=100
+```
+
+Semantics:
+
+```text
+Do not wait longer for QUEUED items.
+Only after the normal short near-ready wait, track items that are already
+SIDECAR_RUNNING and wait up to the configured budget for those tracked items to
+become READY. If they do not become READY within the budget, the existing
+fallback claim path is used.
+```
+
+Remote artifacts:
+
+```text
+/root/mm-sidecar-e2e/tp2_sidecar_running_wait100_probe_seed2712_20260627.json
+/root/mm-sidecar-e2e/tp2_sidecar_running_wait100_strict_seed2713_20260627.json
+/root/mm-sidecar-e2e/run_logs_20260627_154949_direct_cache/api.log
+```
+
+Strict performance comparison:
+
+| transport | imgs | base TTFT | old sidecar TTFT | wait100 TTFT | wait100 vs old | wait100 vs base | old E2E | wait100 E2E | wait100 semantic |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| base64 | 1 | 78.50 | 80.89 | 82.49 | +1.60 | +3.99 | 106.19 | 108.08 | 5/5 |
+| base64 | 13 | 232.68 | 200.97 | 227.51 | +26.55 | -5.17 | 224.96 | 251.29 | 4/5 |
+| base64 | 20 | 422.57 | 305.19 | 336.58 | +31.39 | -85.99 | 360.66 | 361.41 | 5/5 |
+| http | 1 | 78.51 | 84.14 | 83.48 | -0.66 | +4.97 | 109.64 | 108.78 | 5/5 |
+| http | 13 | 1272.30 | 1187.50 | 1016.16 | -171.34 | -256.14 | 1211.15 | 1085.36 | 4/5 |
+| http | 20 | 1486.50 | 1381.13 | 1437.65 | +56.51 | -48.85 | 1405.97 | 1507.45 | 4/5 |
+| local_path | 1 | 80.15 | 83.86 | 83.75 | -0.11 | +3.60 | 109.23 | 109.79 | 5/5 |
+| local_path | 13 | 225.38 | 214.11 | 232.44 | +18.33 | +7.06 | 238.37 | 256.84 | 5/5 |
+| local_path | 20 | 411.80 | 296.21 | 322.57 | +26.36 | -89.23 | 321.27 | 393.46 | 4/5 |
+
+Worker-side wait and fallback profile:
+
+| transport | imgs | fallback avg | sidecar avg | running wait avg/max | total wait avg | worker fetch avg | client RPC avg | barrier avg |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| base64 | 13 | 0.00 | 6.50 | 38.98/78.85 | 41.75 | 49.41 | 48.64 | 10.96 |
+| base64 | 20 | 0.05 | 4.95 | 26.80/104.33 | 28.46 | 24.78 | 23.29 | 8.06 |
+| http | 13 | 0.00 | 6.50 | 2.90/24.86 | 3.50 | 61.29 | 60.45 | 5.09 |
+| http | 20 | 0.00 | 5.00 | 0.00/0.00 | 0.00 | 53.92 | 53.25 | 4.46 |
+| local_path | 13 | 0.00 | 6.50 | 49.70/65.50 | 53.54 | 47.91 | 47.13 | 9.13 |
+| local_path | 20 | 0.00 | 5.00 | 14.43/69.13 | 16.04 | 34.79 | 34.15 | 8.85 |
+
+Conclusion:
+
+```text
+The user's hypothesis is correct mechanically: waiting for SIDECAR_RUNNING can
+almost eliminate local fallback. In the strict run, local fallback is reduced to
+zero or near-zero for multi-image cases.
+
+However, a fixed 100 ms budget is not a safe default. It improves or appears to
+improve some HTTP numbers, but local_path/base64 mostly regress versus the old
+sidecar path, and several strict semantic scores are 4/5 because the model
+returned verbose color sentences instead of the strict single-token contract.
+
+Keep the feature opt-in. The next useful variant is adaptive running wait:
+small budgets such as 10/20/40 ms, or waiting only when historical sidecar
+completion is usually cheaper than local fallback for that transport/image
+count. Do not enable fixed 100 ms by default.
+```
