@@ -25,6 +25,7 @@ from mm_sidecar.integrations.vllm_patch.worker_sidecar import (
     _all_tp_ranks_ready_for_direct_encode,
     _build_vit_dp_execution_plan_for_request,
     _DeferVitDpShardFetchToVisionPatch,
+    _force_local_fallback_enabled,
     _load_balance_assignment,
     _manual_encode_and_gather_local_items,
     _run_dp_sharded_mrope_vision_model_with_sidecar,
@@ -1996,6 +1997,17 @@ class VllmPatchWorkerSidecarTests(unittest.TestCase):
             clear=True,
         ):
             self.assertEqual(_running_ready_wait_by_transport_ms(), {})
+
+    def test_force_local_fallback_env(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertFalse(_force_local_fallback_enabled())
+
+        with mock.patch.dict(
+            os.environ,
+            {"MM_SIDECAR_FORCE_LOCAL_FALLBACK": "1"},
+            clear=True,
+        ):
+            self.assertTrue(_force_local_fallback_enabled())
 
     def test_manual_encode_and_gather_local_items_reconstructs_original_order(self) -> None:
         class _FakeTensor:
