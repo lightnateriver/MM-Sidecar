@@ -162,11 +162,6 @@ def _batch_fetch_ready_enabled() -> bool:
     return value in {"1", "true", "yes", "on"}
 
 
-def _force_local_fallback_enabled() -> bool:
-    value = os.getenv("MM_SIDECAR_FORCE_LOCAL_FALLBACK", "0").strip().lower()
-    return value in {"1", "true", "yes", "on"}
-
-
 def _native_vit_dp_full_replacement_mode(
     model_runner: Any,
     role: TpWorkerRole,
@@ -1169,12 +1164,6 @@ def get_worker_sidecar_client(required: bool = False) -> Any | None:
         return _CLIENT_CACHE
 
 
-def get_worker_sidecar_client_for_fetch(required: bool = False) -> Any | None:
-    if _force_local_fallback_enabled():
-        return None
-    return get_worker_sidecar_client(required=required)
-
-
 def reset_worker_sidecar_client_cache() -> None:
     global _CLIENT_CACHE
     with _CLIENT_LOCK:
@@ -1294,7 +1283,7 @@ def _reconstruct_request_plan_from_manager(
     if not cache_keys:
         return None
 
-    client = get_worker_sidecar_client_for_fetch(required=False)
+    client = get_worker_sidecar_client(required=False)
     if client is None:
         return None
     try:
@@ -1358,7 +1347,7 @@ def build_worker_source_plan(
 
     role = _resolve_tp_worker_role()
     effective_rank = role.local_rank if producer_rank is None else producer_rank
-    client = get_worker_sidecar_client_for_fetch(required=False)
+    client = get_worker_sidecar_client(required=False)
     coordinator = SidecarFallbackCoordinator(
         manager=client,
         claimer_id=build_ranked_claimer_id(
@@ -1814,7 +1803,7 @@ def _build_vit_dp_execution_plan_for_request(
 
     source_plan = None
     if descriptors:
-        client = get_worker_sidecar_client_for_fetch(required=False)
+        client = get_worker_sidecar_client(required=False)
         coordinator = SidecarFallbackCoordinator(
             manager=client,
             claimer_id=build_ranked_claimer_id(
@@ -1887,7 +1876,7 @@ def _sidecar_or_fallback_items_for_plan(
     if not local_descriptors:
         return [], {}
 
-    client = get_worker_sidecar_client_for_fetch(required=False)
+    client = get_worker_sidecar_client(required=False)
     diagnostics: dict[str, float] = {}
     artifacts: list[Any] = []
     if client is None or not plan.binding.enabled:
@@ -2061,7 +2050,7 @@ def _fetch_vit_dp_shard_pixel_values(
     descriptors = [item.descriptor for item in local_items]
     handles = [item.handle for item in local_items]
     local_media_indexes = tuple(int(item.request_media_index) for item in local_items)
-    client = get_worker_sidecar_client_for_fetch(required=False)
+    client = get_worker_sidecar_client(required=False)
     diagnostics: dict[str, float] = {}
     artifacts: list[Any] = []
 
@@ -2856,7 +2845,7 @@ def try_replace_scheduled_mm_inputs_from_sidecar(
                 "skip_replace feature_data_ready"
             )
             continue
-        client = get_worker_sidecar_client_for_fetch(required=False)
+        client = get_worker_sidecar_client(required=False)
         if client is None or not binding.enabled:
             local_artifacts = _run_local_fallback_artifacts(descriptors)
             replaced += replace_feature_data_from_sidecar_artifacts(
