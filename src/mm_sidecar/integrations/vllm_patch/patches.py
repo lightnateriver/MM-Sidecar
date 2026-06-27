@@ -130,6 +130,19 @@ def _debug_route_enabled() -> bool:
     return value in {"1", "true", "yes", "on"}
 
 
+def _min_image_count_for_descriptor_only_dummy() -> int:
+    try:
+        return max(1, int(os.getenv("MM_SIDECAR_MIN_IMAGE_COUNT", "2")))
+    except (TypeError, ValueError):
+        return 2
+
+
+def _descriptor_only_dummy_allowed(item_index: int | None) -> bool:
+    if item_index is None:
+        return False
+    return int(item_index) + 1 >= _min_image_count_for_descriptor_only_dummy()
+
+
 def _capture_image_result(
     *,
     item_index: int | None,
@@ -392,6 +405,7 @@ def apply_monkey_patches() -> None:
             if (
                 descriptor_only_capture_enabled()
                 and sidecar_prepare_result is not None
+                and _descriptor_only_dummy_allowed(item_index)
                 and _try_capture_descriptor_only_probe(
                     item_index=item_index,
                     captured_ref=captured_ref,
@@ -441,6 +455,7 @@ def apply_monkey_patches() -> None:
             if (
                 descriptor_only_capture_enabled()
                 and sidecar_prepare_result is not None
+                and _descriptor_only_dummy_allowed(item_index)
                 and _try_capture_descriptor_only_probe(
                     item_index=item_index,
                     captured_ref=captured_ref,

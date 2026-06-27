@@ -6,7 +6,10 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 
-from mm_sidecar.integrations.vllm_patch.patches import _RequestCaptureMiddleware
+from mm_sidecar.integrations.vllm_patch.patches import (
+    _RequestCaptureMiddleware,
+    _descriptor_only_dummy_allowed,
+)
 
 
 class _FakeApp:
@@ -43,6 +46,22 @@ def _make_send_collector(messages: list[dict[str, Any]]):
 
 
 class VllmPatchMiddlewareTests(unittest.TestCase):
+    def test_descriptor_only_dummy_waits_until_min_image_count(self) -> None:
+        with patch.dict(
+            "os.environ",
+            {"MM_SIDECAR_MIN_IMAGE_COUNT": "2"},
+            clear=False,
+        ):
+            self.assertFalse(_descriptor_only_dummy_allowed(0))
+            self.assertTrue(_descriptor_only_dummy_allowed(1))
+
+        with patch.dict(
+            "os.environ",
+            {"MM_SIDECAR_MIN_IMAGE_COUNT": "1"},
+            clear=False,
+        ):
+            self.assertTrue(_descriptor_only_dummy_allowed(0))
+
     def test_debug_route_bypasses_capture(self) -> None:
         app = _FakeApp()
         state = SimpleNamespace(mm_sidecar_last_capture={"request_id": "keep"})
