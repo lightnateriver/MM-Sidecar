@@ -10,11 +10,13 @@ import time
 from threading import Lock
 from typing import Any
 
+from mm_sidecar.contracts import LocalFileTensorPayloadRef
 from mm_sidecar.integrations.vllm_patch.carrier import (
     SidecarRequestPlan,
     decode_sidecar_request_plan,
     get_sidecar_payload_from_params,
 )
+from mm_sidecar.sidecar.artifact_store import load_local_file_tensor_ref
 from mm_sidecar.sidecar import (
     SidecarFallbackCoordinator,
     SidecarFetchBatch,
@@ -1980,6 +1982,8 @@ def _artifact_to_pixel_values_tensor(
         raise RuntimeError("sidecar artifact missing pixel_values payload")
     if isinstance(raw_pixel_values, torch.Tensor):
         tensor = raw_pixel_values
+    elif isinstance(raw_pixel_values, LocalFileTensorPayloadRef):
+        tensor = torch.from_numpy(load_local_file_tensor_ref(raw_pixel_values))
     else:
         tensor = torch.as_tensor(raw_pixel_values)
     return tensor.to(

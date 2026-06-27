@@ -8,6 +8,7 @@ from .limits import IngressLimits
 from .media_source import (
     CapturedImageRef,
     ImageTensorPayload,
+    LocalFileTensorPayloadRef,
     MediaSourceRef,
     NormalizedImage,
 )
@@ -19,6 +20,7 @@ __all__ = [
     "ImageScheduleItem",
     "IngressLimits",
     "ImageTensorPayload",
+    "LocalFileTensorPayloadRef",
     "MediaSourceRef",
     "MediaTransport",
     "NormalizedImage",

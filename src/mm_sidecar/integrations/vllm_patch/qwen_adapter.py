@@ -5,7 +5,8 @@ from typing import Any
 
 import numpy as np
 
-from mm_sidecar.contracts import ProcessorSignature
+from mm_sidecar.contracts import LocalFileTensorPayloadRef, ProcessorSignature
+from mm_sidecar.sidecar.artifact_store import load_local_file_tensor_ref
 from mm_sidecar.sidecar.protocol import PreparedArtifact
 
 SYNTHETIC_PLACEHOLDER_ATTR = "_mm_sidecar_synthetic_placeholder"
@@ -52,6 +53,8 @@ def _to_torch_tensor(value: Any, *, dtype: Any | None = None):
 
     if isinstance(value, torch.Tensor):
         tensor = value
+    elif isinstance(value, LocalFileTensorPayloadRef):
+        tensor = torch.from_numpy(load_local_file_tensor_ref(value))
     elif isinstance(value, np.ndarray):
         tensor = torch.from_numpy(value)
     else:

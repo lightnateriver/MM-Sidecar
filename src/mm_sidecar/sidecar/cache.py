@@ -8,6 +8,7 @@ from typing import Any
 from mm_sidecar.contracts import ArtifactDescriptor
 
 from .config import MemoryCacheConfig
+from .artifact_store import cleanup_local_file_payload
 
 
 def _now_ms() -> float:
@@ -63,6 +64,7 @@ class CpuMemoryCachePool:
         previous = self._reusable.pop(cache_key, None)
         if previous is not None:
             self._reusable_bytes -= previous.size_bytes
+            cleanup_local_file_payload(previous.payload)
         entry = _ReusableEntry(
             descriptor=descriptor,
             payload=payload,
@@ -86,6 +88,13 @@ class CpuMemoryCachePool:
             "inflight_items": len(self._inflight),
         }
 
+    def close(self) -> None:
+        while self._reusable:
+            _, entry = self._reusable.popitem(last=False)
+            cleanup_local_file_payload(entry.payload)
+        self._reusable_bytes = 0
+        self._inflight.clear()
+
     def _evict_expired(self) -> None:
         now_ms = _now_ms()
         expired_keys = [
@@ -96,9 +105,11 @@ class CpuMemoryCachePool:
         for cache_key in expired_keys:
             entry = self._reusable.pop(cache_key)
             self._reusable_bytes -= entry.size_bytes
+            cleanup_local_file_payload(entry.payload)
 
     def _evict_lru_until_within_budget(self) -> None:
         max_bytes = self._config.max_reusable_bytes
         while self._reusable and self._reusable_bytes > max_bytes:
             _, entry = self._reusable.popitem(last=False)
             self._reusable_bytes -= entry.size_bytes
+            cleanup_local_file_payload(entry.payload)

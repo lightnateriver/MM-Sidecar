@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import tempfile
 import unittest
 from importlib.util import find_spec
+from pathlib import Path
 
 import numpy as np
 
 from mm_sidecar.contracts import (
     ArtifactDescriptor,
     ImageTensorPayload,
+    LocalFileTensorPayloadRef,
     ProcessorConfig,
     ProcessorSignature,
     StorageKind,
@@ -73,6 +76,50 @@ def _make_artifact(index: int = 0) -> PreparedArtifact:
     )
 
 
+def _make_local_file_artifact(path: Path, index: int = 0) -> PreparedArtifact:
+    signature = _make_signature()
+    grid_thw = (1, 36, 20)
+    pixel_values = np.arange(720 * 588, dtype=np.float32).reshape(720, 588)
+    with open(path, "wb") as handle:
+        np.save(handle, pixel_values, allow_pickle=False)
+    ref = LocalFileTensorPayloadRef(
+        path=str(path),
+        shape=tuple(int(dim) for dim in pixel_values.shape),
+        dtype=str(pixel_values.dtype),
+        nbytes=int(pixel_values.nbytes),
+    )
+    descriptor = ArtifactDescriptor(
+        artifact_id="artifact-adapter-local-file",
+        item_identity="image-adapter-local-file",
+        processor_signature=signature,
+        image_grid_thw=grid_thw,
+        payload_shape=(720, 588),
+        payload_dtype="float32",
+        storage_kind=StorageKind.LOCAL_FILE,
+        payload_nbytes=int(pixel_values.nbytes),
+    )
+    payload = ImageTensorPayload(
+        pixel_values=ref,
+        image_grid_thw=grid_thw,
+        payload_shape=(720, 588),
+        payload_dtype="float32",
+        storage_kind=StorageKind.LOCAL_FILE,
+        resized_size_hw=(504, 280),
+        orig_size_hw=(512, 288),
+    )
+    return PreparedArtifact(
+        handle=SidecarHandle(
+            request_id="req-adapter-local-file",
+            request_media_index=index,
+            cache_key="cache-adapter-local-file",
+            epoch=0,
+        ),
+        descriptor=descriptor,
+        payload=payload,
+        timings_ms={"total": 1.0},
+    )
+
+
 class _FakeFeature:
     def __init__(self, modality: str = "image") -> None:
         self.modality = modality
@@ -100,6 +147,16 @@ class VllmPatchQwenAdapterTests(unittest.TestCase):
         self.assertEqual(item["image_grid_thw"].data.tolist(), [1, 36, 20])
         self.assertTrue(item["image_grid_thw"].field.keep_on_cpu)
         self.assertFalse(is_synthetic_qwen_mm_kwargs_item(item))
+
+    def test_sidecar_artifact_to_qwen_mm_kwargs_item_loads_local_file_ref(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            artifact = _make_local_file_artifact(Path(tmpdir) / "payload.npy")
+            item = sidecar_artifact_to_qwen_mm_kwargs_item(artifact)
+
+        self.assertIn("pixel_values", item)
+        self.assertEqual(tuple(item["pixel_values"].data.shape), (720, 588))
+        self.assertEqual(float(item["pixel_values"].data[0, 0]), 0.0)
+        self.assertEqual(float(item["pixel_values"].data[-1, -1]), float(720 * 588 - 1))
 
     def test_planned_item_to_synthetic_qwen_mm_kwargs_item(self) -> None:
         signature = _make_signature().value.replace("|temporal=1|", "|temporal=2|")

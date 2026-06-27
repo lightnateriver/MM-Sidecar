@@ -50,6 +50,15 @@ class CapturedImageRef:
 
 
 @dataclass(frozen=True, slots=True)
+class LocalFileTensorPayloadRef:
+    path: str
+    shape: tuple[int, ...]
+    dtype: str
+    nbytes: int
+    format: str = "npy"
+
+
+@dataclass(frozen=True, slots=True)
 class ImageTensorPayload:
     pixel_values: Any
     image_grid_thw: tuple[int, int, int]
@@ -64,6 +73,8 @@ class ImageTensorPayload:
     @property
     def nbytes(self) -> int:
         pixel_values = self.pixel_values
+        if isinstance(pixel_values, LocalFileTensorPayloadRef):
+            return int(pixel_values.nbytes)
         if hasattr(pixel_values, "nbytes"):
             return int(pixel_values.nbytes)
         if isinstance(pixel_values, (bytes, bytearray, memoryview)):

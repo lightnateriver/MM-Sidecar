@@ -1,19 +1,23 @@
 from __future__ import annotations
 
+import os
 import tempfile
 import unittest
 from io import BytesIO
 from pathlib import Path
+from unittest import mock
 
 from PIL import Image
 
 from mm_sidecar.contracts import (
     CapturedImageRef,
     IngressLimits,
+    LocalFileTensorPayloadRef,
     MediaTransport,
     NormalizedImage,
     ProcessorConfig,
     ProcessorSignature,
+    StorageKind,
 )
 from mm_sidecar.contracts.identity import build_local_source_key
 from mm_sidecar.contracts.media_source import MediaSourceRef
@@ -23,6 +27,7 @@ from mm_sidecar.sidecar import (
     SidecarState,
 )
 from mm_sidecar.sidecar.config import MemoryCacheConfig, SidecarManagerConfig, WorkerPoolConfig
+from mm_sidecar.sidecar.artifact_store import load_local_file_tensor_ref
 from mm_sidecar.sidecar.protocol import FallbackDescriptor
 from mm_sidecar.sidecar.coordinator import build_ranked_claimer_id
 from mm_sidecar.sidecar.processor import run_descriptor_locally
@@ -245,6 +250,67 @@ class SidecarServiceTests(unittest.TestCase):
                 finally:
                     service.join(timeout=2.0)
                     service.terminate()
+
+    def test_service_process_worker_pool_can_return_local_file_payload_ref(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            image_path = Path(tmpdir) / "service-local-file.jpg"
+            image_path.write_bytes(_make_jpeg_bytes())
+            payload_dir = Path(tmpdir) / "payloads"
+            service = SidecarServiceProcess(
+                SidecarServiceConfig(
+                    worker_pool_mode="process",
+                    start_method="fork",
+                    manager=SidecarManagerConfig(
+                        cache=MemoryCacheConfig(max_reusable_bytes=8 * 1024 * 1024),
+                        workers=WorkerPoolConfig(worker_count=1, start_method="fork"),
+                    ),
+                )
+            )
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "MM_SIDECAR_PAYLOAD_STORAGE": "local_file",
+                    "MM_SIDECAR_PAYLOAD_DIR": str(payload_dir),
+                },
+            ):
+                client = service.start()
+                ref_path: Path | None = None
+                try:
+                    descriptor = _build_local_descriptor(image_path)
+                    handles = client.prepare([descriptor])
+                    ready = client.wait_for_states(handles, {SidecarState.READY}, 1000.0)
+                    self.assertEqual(ready[0].state, SidecarState.READY)
+                    artifact = client.fetch_ready(handles[0])
+                    self.assertIsNotNone(artifact)
+                    assert artifact is not None
+                    self.assertEqual(artifact.descriptor.storage_kind, StorageKind.LOCAL_FILE)
+                    self.assertEqual(artifact.payload.storage_kind, StorageKind.LOCAL_FILE)
+                    self.assertIsInstance(
+                        artifact.payload.pixel_values,
+                        LocalFileTensorPayloadRef,
+                    )
+                    ref = artifact.payload.pixel_values
+                    assert isinstance(ref, LocalFileTensorPayloadRef)
+                    ref_path = Path(ref.path)
+                    self.assertTrue(ref_path.exists())
+                    array = load_local_file_tensor_ref(ref)
+                    self.assertEqual(tuple(array.shape), tuple(artifact.payload.payload_shape))
+                    self.assertEqual(str(array.dtype), artifact.payload.payload_dtype)
+                    self.assertIsNotNone(artifact.fetch_diagnostics_ms)
+                    assert artifact.fetch_diagnostics_ms is not None
+                    self.assertIn(
+                        "payload_local_file_write_ms",
+                        artifact.fetch_diagnostics_ms,
+                    )
+                finally:
+                    try:
+                        client.shutdown()
+                    finally:
+                        service.join(timeout=2.0)
+                        service.terminate()
+                self.assertIsNotNone(ref_path)
+                assert ref_path is not None
+                self.assertFalse(ref_path.exists())
 
     def test_service_can_publish_and_fetch_request_local_fallback(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

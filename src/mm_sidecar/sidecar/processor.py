@@ -25,6 +25,7 @@ from mm_sidecar.contracts import (
     StorageKind,
 )
 
+from .artifact_store import local_file_payload_enabled, materialize_payload_to_local_file
 from .config import WorkerPoolConfig
 from .protocol import FallbackDescriptor, PreparedArtifact, SidecarHandle
 
@@ -386,10 +387,22 @@ def _complete_payload_task(
 ) -> tuple[ArtifactDescriptor, ImageTensorPayload, dict[str, float]]:
     descriptor, payload = _build_image_tensor_payload(image, task.descriptor, plan)
     after_preprocess = time.perf_counter()
+    payload_local_file_write_ms = 0.0
+    if task.assigned_worker_id >= 0 and local_file_payload_enabled():
+        descriptor, payload, payload_local_file_write_ms = (
+            materialize_payload_to_local_file(
+                cache_key=task.cache_key,
+                epoch=task.epoch,
+                descriptor=descriptor,
+                payload=payload,
+            )
+        )
+    after_payload_ready = time.perf_counter()
     completed_timings_ms = {
         **timings_ms,
         "preprocess": (after_preprocess - after_probe) * 1000.0,
-        "total": (after_preprocess - started_at) * 1000.0,
+        "payload_local_file_write_ms": payload_local_file_write_ms,
+        "total": (after_payload_ready - started_at) * 1000.0,
     }
     return descriptor, payload, completed_timings_ms
 

@@ -48,6 +48,7 @@ def _timing_diagnostics(timings: dict[str, float] | None) -> dict[str, float]:
         "probe": "worker_probe_ms",
         "preprocess": "worker_preprocess_ms",
         "total": "worker_total_ms",
+        "payload_local_file_write_ms": "payload_local_file_write_ms",
         "worker_ready_put_call_ms": "worker_ready_put_call_ms",
         "worker_ready_payload_nbytes": "worker_ready_payload_nbytes",
         "manager_ready_queue_to_apply_ms": "manager_ready_queue_to_apply_ms",
@@ -135,6 +136,9 @@ class SidecarManager:
         if self._ready_drain_thread is not None:
             self._ready_drain_thread.join(timeout=1.0)
         self._worker_pool.close()
+        close_cache = getattr(self._cache_pool, "close", None)
+        if callable(close_cache):
+            close_cache()
 
     def prepare(
         self,
