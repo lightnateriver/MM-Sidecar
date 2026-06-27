@@ -28,6 +28,7 @@ from mm_sidecar.integrations.vllm_patch.worker_sidecar import (
     _load_balance_assignment,
     _manual_encode_and_gather_local_items,
     _run_dp_sharded_mrope_vision_model_with_sidecar,
+    _running_ready_wait_by_transport_ms,
     _source_plan_entries_debug,
     _source_plan_numeric_diagnostics,
     _try_execute_vit_dp_sidecar_direct_encode,
@@ -1935,6 +1936,7 @@ class VllmPatchWorkerSidecarTests(unittest.TestCase):
             ),
             near_ready_wait_ms=3.5,
             running_ready_wait_ms=4.0,
+            final_status_check_ms=1.25,
             used_fail_open=False,
         )
 
@@ -1947,7 +1949,8 @@ class VllmPatchWorkerSidecarTests(unittest.TestCase):
         self.assertEqual(diagnostics["source_plan_remote_fallback_count"], 1.0)
         self.assertEqual(diagnostics["source_plan_near_ready_wait_ms"], 3.5)
         self.assertEqual(diagnostics["source_plan_running_ready_wait_ms"], 4.0)
-        self.assertEqual(diagnostics["source_plan_reported_wait_ms"], 7.5)
+        self.assertEqual(diagnostics["source_plan_final_status_check_ms"], 1.25)
+        self.assertEqual(diagnostics["source_plan_reported_wait_ms"], 8.75)
         self.assertEqual(diagnostics["source_plan_state_ready"], 1.0)
         self.assertEqual(diagnostics["source_plan_state_sidecar_running"], 1.0)
         self.assertEqual(
@@ -1958,6 +1961,41 @@ class VllmPatchWorkerSidecarTests(unittest.TestCase):
             "1:FALLBACK:SIDECAR_RUNNING:preview_requires_fallback:rank=0",
             _source_plan_entries_debug(source_plan, only_indexes={1}),
         )
+
+    def test_running_ready_wait_by_transport_env_defaults_and_overrides(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(
+                _running_ready_wait_by_transport_ms(),
+                {"local_path": 8.0, "base64": 12.0, "http": 30.0},
+            )
+
+        with mock.patch.dict(
+            os.environ,
+            {"MM_SIDECAR_RUNNING_READY_WAIT_MS": "0"},
+            clear=True,
+        ):
+            self.assertEqual(_running_ready_wait_by_transport_ms(), {})
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                "MM_SIDECAR_RUNNING_READY_WAIT_BY_TRANSPORT_MS": (
+                    "local_path=5,base64=0,http=17,unknown=99,bad"
+                )
+            },
+            clear=True,
+        ):
+            self.assertEqual(
+                _running_ready_wait_by_transport_ms(),
+                {"local_path": 5.0, "base64": 0.0, "http": 17.0},
+            )
+
+        with mock.patch.dict(
+            os.environ,
+            {"MM_SIDECAR_ENABLE_ADAPTIVE_RUNNING_READY_WAIT": "0"},
+            clear=True,
+        ):
+            self.assertEqual(_running_ready_wait_by_transport_ms(), {})
 
     def test_manual_encode_and_gather_local_items_reconstructs_original_order(self) -> None:
         class _FakeTensor:

@@ -309,6 +309,46 @@ def _running_ready_wait_ms() -> float:
         return 0.0
 
 
+_DEFAULT_RUNNING_READY_WAIT_BY_TRANSPORT_MS = {
+    "local_path": 8.0,
+    "base64": 12.0,
+    "http": 30.0,
+}
+
+
+def _adaptive_running_ready_wait_enabled() -> bool:
+    value = os.getenv(
+        "MM_SIDECAR_ENABLE_ADAPTIVE_RUNNING_READY_WAIT",
+        "1",
+    ).strip().lower()
+    return value not in {"0", "false", "no", "off"}
+
+
+def _running_ready_wait_by_transport_ms() -> dict[str, float]:
+    raw_global_wait = os.getenv("MM_SIDECAR_RUNNING_READY_WAIT_MS")
+    if raw_global_wait is not None and raw_global_wait.strip():
+        return {}
+    if not _adaptive_running_ready_wait_enabled():
+        return {}
+    raw = os.getenv("MM_SIDECAR_RUNNING_READY_WAIT_BY_TRANSPORT_MS")
+    if raw is None or not raw.strip():
+        return dict(_DEFAULT_RUNNING_READY_WAIT_BY_TRANSPORT_MS)
+
+    budgets: dict[str, float] = {}
+    for item in raw.split(","):
+        key, separator, value = item.strip().partition("=")
+        if not separator:
+            continue
+        key = key.strip().lower()
+        if key not in _DEFAULT_RUNNING_READY_WAIT_BY_TRANSPORT_MS:
+            continue
+        try:
+            budgets[key] = max(0.0, float(value.strip()))
+        except ValueError:
+            continue
+    return budgets
+
+
 def _defer_vit_dp_direct_cache_on_fallback_enabled() -> bool:
     value = os.getenv(
         "MM_SIDECAR_DEFER_VIT_DP_DIRECT_CACHE_ON_FALLBACK",
@@ -887,6 +927,9 @@ def _source_plan_numeric_diagnostics(
         "source_plan_running_ready_wait_ms": float(
             getattr(source_plan, "running_ready_wait_ms", 0.0) or 0.0
         ),
+        "source_plan_final_status_check_ms": float(
+            getattr(source_plan, "final_status_check_ms", 0.0) or 0.0
+        ),
         "source_plan_used_fail_open": (
             1.0 if bool(getattr(source_plan, "used_fail_open", False)) else 0.0
         ),
@@ -894,6 +937,7 @@ def _source_plan_numeric_diagnostics(
     diagnostics["source_plan_reported_wait_ms"] = (
         diagnostics["source_plan_near_ready_wait_ms"]
         + diagnostics["source_plan_running_ready_wait_ms"]
+        + diagnostics["source_plan_final_status_check_ms"]
     )
     for entry in entries:
         decision = getattr(entry, "decision", None)
@@ -1317,6 +1361,7 @@ def build_worker_source_plan(
         observe_plan_wait_ms=_peer_plan_wait_ms(),
         batch_fetch_ready=_batch_fetch_ready_enabled(),
         running_ready_wait_ms=_running_ready_wait_ms(),
+        running_ready_wait_by_transport_ms=_running_ready_wait_by_transport_ms(),
     )
 
     if client is None or not binding.enabled:
@@ -1772,6 +1817,7 @@ def _build_vit_dp_execution_plan_for_request(
             observe_plan_wait_ms=_peer_plan_wait_ms(),
             batch_fetch_ready=_batch_fetch_ready_enabled(),
             running_ready_wait_ms=_running_ready_wait_ms(),
+            running_ready_wait_by_transport_ms=_running_ready_wait_by_transport_ms(),
         )
         if client is None or not binding.enabled:
             source_plan = coordinator.preview_source_plan(
@@ -1880,6 +1926,7 @@ def _sidecar_or_fallback_items_for_plan(
         observe_plan_wait_ms=_peer_plan_wait_ms(),
         batch_fetch_ready=_batch_fetch_ready_enabled(),
         running_ready_wait_ms=_running_ready_wait_ms(),
+        running_ready_wait_by_transport_ms=_running_ready_wait_by_transport_ms(),
     )
     fetch_start = time.perf_counter()
     fetch_batch = coordinator.fetch_according_to_plan(
@@ -2043,6 +2090,7 @@ def _fetch_vit_dp_shard_pixel_values(
             observe_plan_wait_ms=_peer_plan_wait_ms(),
             batch_fetch_ready=_batch_fetch_ready_enabled(),
             running_ready_wait_ms=_running_ready_wait_ms(),
+            running_ready_wait_by_transport_ms=_running_ready_wait_by_transport_ms(),
         )
         source_plan_start = time.perf_counter()
         source_plan = coordinator.build_source_plan(
@@ -2845,6 +2893,7 @@ def try_replace_scheduled_mm_inputs_from_sidecar(
                 observe_plan_wait_ms=_peer_plan_wait_ms(),
                 batch_fetch_ready=_batch_fetch_ready_enabled(),
                 running_ready_wait_ms=_running_ready_wait_ms(),
+                running_ready_wait_by_transport_ms=_running_ready_wait_by_transport_ms(),
             )
             plan_start = time.perf_counter()
             if native_vit_dp_full_replacement:

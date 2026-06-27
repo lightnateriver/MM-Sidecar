@@ -67,11 +67,17 @@ def _make_limits() -> IngressLimits:
     )
 
 
-def _make_descriptor(path: Path, request_id: str, item_index: int) -> FallbackDescriptor:
+def _make_descriptor(
+    path: Path,
+    request_id: str,
+    item_index: int,
+    *,
+    transport: MediaTransport = MediaTransport.LOCAL_PATH,
+) -> FallbackDescriptor:
     stat_result = path.stat()
     with Image.open(path) as image:
-        normalized = NormalizedImage(
-            source_ref=MediaSourceRef(
+        if transport is MediaTransport.LOCAL_PATH:
+            source_ref = MediaSourceRef(
                 transport=MediaTransport.LOCAL_PATH,
                 source_key=build_local_source_key(
                     str(path),
@@ -81,12 +87,28 @@ def _make_descriptor(path: Path, request_id: str, item_index: int) -> FallbackDe
                 media_uuid=f"uuid-{request_id}-{item_index}",
                 request_scope_key=None,
                 local_path=str(path.resolve()),
-            ),
+            )
+            local_materialized_path = str(path.resolve())
+        else:
+            source_ref = MediaSourceRef(
+                transport=transport,
+                source_key=f"{transport.value}:{request_id}:{item_index}",
+                media_uuid=f"uuid-{request_id}-{item_index}",
+                request_scope_key=request_id,
+                image_url=(
+                    "data:image/jpeg;base64,ZmFrZQ=="
+                    if transport is MediaTransport.BASE64
+                    else f"https://example.invalid/{request_id}/{item_index}.jpg"
+                ),
+            )
+            local_materialized_path = None
+        normalized = NormalizedImage(
+            source_ref=source_ref,
             orig_size_hw=(image.height, image.width),
             mime_type="image/jpeg",
             byte_size=stat_result.st_size,
             decoded_size_hw=(image.height, image.width),
-            local_materialized_path=str(path.resolve()),
+            local_materialized_path=local_materialized_path,
         )
 
     return FallbackDescriptor(
@@ -323,7 +345,13 @@ class SidecarCoordinatorTests(unittest.TestCase):
 
             self.assertEqual(plan.entries[0].decision, SourcePlanDecision.FALLBACK)
             self.assertEqual(plan.entries[0].producer_rank, 2)
-            self.assertEqual(plan.entries[0].reason, "fallback_claim_granted")
+            self.assertIn(
+                plan.entries[0].reason,
+                {
+                    "queued_timeout_fallback_claim_granted",
+                    "running_timeout_fallback_claim_granted",
+                },
+            )
             manager.close()
 
     def test_running_ready_wait_can_avoid_local_fallback(self) -> None:
@@ -354,6 +382,69 @@ class SidecarCoordinatorTests(unittest.TestCase):
             self.assertGreaterEqual(plan.running_ready_wait_ms, 0.0)
             self.assertEqual(manager.batch_get_status_calls, 2)
 
+    def test_transport_running_ready_wait_can_avoid_local_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            image_path = Path(tmpdir) / "running-budget.jpg"
+            image_path.write_bytes(_make_jpeg_bytes())
+            descriptor = _make_descriptor(
+                image_path,
+                "req-running-budget",
+                0,
+                transport=MediaTransport.BASE64,
+            )
+            handle = _make_handle(descriptor)
+            manager = _SequencedStatusManager(
+                states=[SidecarState.SIDECAR_RUNNING, SidecarState.READY],
+            )
+
+            coordinator = SidecarFallbackCoordinator(
+                manager=manager,
+                claimer_id="rank-0",
+                producer_rank=0,
+                near_ready_wait_ms=0.0,
+                poll_interval_ms=0.0,
+                running_ready_wait_by_transport_ms={"base64": 12.0},
+            )
+            plan = coordinator.build_source_plan(
+                descriptors=[descriptor],
+                handles=[handle],
+            )
+
+            self.assertEqual(plan.entries[0].decision, SourcePlanDecision.USE_SIDECAR)
+            self.assertEqual(manager.try_fallback_claim_calls, 0)
+            self.assertGreaterEqual(plan.running_ready_wait_ms, 0.0)
+
+    def test_final_status_check_avoids_ready_claim_race(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            image_path = Path(tmpdir) / "final-check.jpg"
+            image_path.write_bytes(_make_jpeg_bytes())
+            descriptor = _make_descriptor(image_path, "req-final-check", 0)
+            handle = _make_handle(descriptor)
+            manager = _SequencedStatusManager(
+                states=[SidecarState.SIDECAR_RUNNING, SidecarState.READY],
+            )
+
+            coordinator = SidecarFallbackCoordinator(
+                manager=manager,
+                claimer_id="rank-0",
+                producer_rank=0,
+                near_ready_wait_ms=0.0,
+                poll_interval_ms=0.0,
+            )
+            plan = coordinator.build_source_plan(
+                descriptors=[descriptor],
+                handles=[handle],
+            )
+
+            self.assertEqual(plan.entries[0].decision, SourcePlanDecision.USE_SIDECAR)
+            self.assertEqual(
+                plan.entries[0].reason,
+                "ready_after_final_status_check",
+            )
+            self.assertEqual(manager.try_fallback_claim_calls, 0)
+            self.assertEqual(manager.batch_get_status_calls, 2)
+            self.assertGreaterEqual(plan.final_status_check_ms, 0.0)
+
     def test_running_ready_wait_does_not_wait_for_queued_items(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             image_path = Path(tmpdir) / "queued.jpg"
@@ -378,7 +469,8 @@ class SidecarCoordinatorTests(unittest.TestCase):
             self.assertEqual(plan.entries[0].decision, SourcePlanDecision.FALLBACK)
             self.assertEqual(manager.try_fallback_claim_calls, 1)
             self.assertEqual(plan.running_ready_wait_ms, 0.0)
-            self.assertEqual(manager.batch_get_status_calls, 1)
+            self.assertEqual(plan.entries[0].reason, "queued_timeout_fallback_claim_granted")
+            self.assertEqual(manager.batch_get_status_calls, 2)
 
     def test_manager_unavailable_uses_fail_open_plan(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
