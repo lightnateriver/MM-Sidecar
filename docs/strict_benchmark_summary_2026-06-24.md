@@ -571,10 +571,133 @@ The remaining precision issue is output-contract stability under 20-image
 local_path/base64 sidecar runs, not image payload alignment.
 ```
 
+## TP2 Single-Image Bypass And Timing Breakdown
+
+The TP2 direct-cache run showed that 1-image requests were consistently slower
+than baseline because fixed sidecar/control-plane overhead dominated. The main
+code now defaults to `MM_SIDECAR_MIN_IMAGE_COUNT=2`, so single-image requests
+with an available sidecar manager bypass the sidecar payload path and keep the
+native vLLM image path. Multi-image requests still use sidecar.
+
+Code commits:
+
+```text
+ffc0f34 feat: bypass single-image sidecar and add timings
+82152ca test: relax api fast path payload assertion
+808f2e1 fix: keep descriptor-only dummy off for single-image bypass
+```
+
+Important correctness fix:
+
+```text
+The first implementation disabled the final sidecar payload for single-image
+requests, but descriptor-only parsing still replaced the actual image with a
+1x1 dummy placeholder. That made local_path/base64 single-image runs return
+"black". The fix keeps descriptor-only dummy disabled until the parsed image
+index reaches MM_SIDECAR_MIN_IMAGE_COUNT. With the default threshold of 2,
+single-image requests keep the real native image; multi-image requests can use
+dummy placeholders from the second image onward.
+```
+
+Remote CUDA validation used:
+
+```text
+model: /autodl-fs/data/qwen3.5-0.8b
+TP: 2
+ViT-DP: --mm-encoder-tp-mode data
+serving mode: --enforce-eager
+sidecar workers: 32
+strict protocol: warmup 3 + measured 5
+seed: 2026062703
+```
+
+Artifacts:
+
+```text
+/root/mm-sidecar-e2e/tp2_sidecar_min2_dummyfix_seed2703_20260627.json
+/root/mm-sidecar-e2e/tp2_sidecar_min2_dummyfix_seed2703_20260627.md
+/root/mm-sidecar-e2e/tp2_sidecar_min2_timing_seed2703_20260627.json
+/root/mm-sidecar-e2e/tp2_sidecar_min2_timing_seed2703_20260627.md
+/root/mm-sidecar-e2e/run_logs_20260627_105852_direct_cache/api.log
+```
+
+Comparison note: baseline and old sidecar columns use the prior strict seed
+`2026062701`; the new min2 columns use seed `2026062703`.
+
+| transport | images | baseline TTFT | old sidecar TTFT | min2 bug TTFT | min2 fixed TTFT | fixed semantic |
+|---|---:|---:|---:|---:|---:|---:|
+| local_path | 1 | 80.15 | 94.21 | 68.47 | 83.86 | 5/5 |
+| local_path | 13 | 225.38 | 227.27 | 222.68 | 214.11 | 5/5 |
+| local_path | 20 | 411.80 | 335.49 | 300.69 | 296.21 | 5/5 |
+| http | 1 | 78.51 | 94.73 | 86.96 | 84.14 | 5/5 |
+| http | 13 | 1272.30 | 1185.72 | 1183.80 | 1187.50 | 5/5 |
+| http | 20 | 1486.50 | 1359.13 | 1390.77 | 1381.13 | 5/5 |
+| base64 | 1 | 78.50 | 90.21 | 68.55 | 80.89 | 5/5 |
+| base64 | 13 | 232.68 | 194.59 | 200.21 | 200.97 | 5/5 |
+| base64 | 20 | 422.57 | 283.59 | 306.92 | 305.19 | 4/5 |
+
+Fixed-run E2E summary:
+
+| transport | images | TTFT avg/max ms | E2E avg/max ms | semantic |
+|---|---:|---:|---:|---:|
+| local_path | 1 | 83.86/85.44 | 109.23/110.80 | 5/5 |
+| local_path | 13 | 214.11/237.57 | 238.37/262.08 | 5/5 |
+| local_path | 20 | 296.21/326.97 | 321.27/351.93 | 5/5 |
+| http | 1 | 84.14/85.48 | 109.64/111.01 | 5/5 |
+| http | 13 | 1187.50/1203.28 | 1211.15/1225.40 | 5/5 |
+| http | 20 | 1381.13/1527.82 | 1405.97/1553.02 | 5/5 |
+| base64 | 1 | 80.89/81.26 | 106.19/106.50 | 5/5 |
+| base64 | 13 | 200.97/209.22 | 224.96/233.73 | 5/5 |
+| base64 | 20 | 305.19/322.86 | 360.66/486.41 | 4/5 |
+
+API-side timing from the fixed run:
+
+```text
+single-image bypass:
+  sidecar_prepare.enabled=false
+  reason=image_count_below_min
+  api_prepare_total ~= 0.02 ms
+  descriptor_build/metadata_wait ~= 0 ms
+
+multi-image sidecar:
+  api_prepare_total ~= 3.6-7.4 ms
+  descriptor_build ~= 0.3-0.7 ms
+  metadata wait ~= 2.7-5.6 ms
+```
+
+Worker-side timing from direct-cache debug logs:
+
+| transport | images | worker fetch total ms | client RPC ms | local fallback ms | encode+gather ms | ready barrier ms | payload bytes/rank |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| local_path | 13 | 59.95 | 28.21 | 20.26 | 11.97 | 9.07 | 23.0 MB |
+| local_path | 20 | 30.02 | 22.26 | 16.81 | 10.33 | 3.43 | 17.7 MB |
+| http | 13 | 29.16 | 28.56 | n/a | 12.07 | 2.24 | 23.0 MB |
+| http | 20 | 21.34 | 20.82 | n/a | 11.14 | 2.62 | 17.7 MB |
+| base64 | 13 | 52.90 | 21.05 | 19.06 | 11.26 | 9.02 | 23.0 MB |
+| base64 | 20 | 34.66 | 26.97 | 11.54 | 10.33 | 4.30 | 17.7 MB |
+
+Interpretation:
+
+```text
+The metadata-wait/API-prepare path is no longer the dominant bottleneck.
+For multi-image cases, remaining time is mostly in model-worker side payload
+movement and fallback/sidecar artifact materialization:
+
+- client_rpc_total/fetch_ms is often 20-28 ms per rank.
+- local fallback, when present, adds roughly 10-20 ms.
+- direct encode + all-gather is roughly 10-12 ms.
+- encoder-cache writes are negligible, around 0.1 ms.
+
+The next high-value optimization is therefore not metadata wait. It is reducing
+or avoiding the 10-25 MB/rank tensor payload transfer/materialization path,
+for example via shared-memory tensor payloads or a direct worker-side source
+plan that avoids Python object serialization for pixel_values.
+```
+
 ## Next Engineering Priorities
 
-1. Add request-scoped timestamps around `wait_for_metadata()` and sidecar service RPC boundaries.
-2. Emit worker result `put` timestamps and manager `_drain_results()` receive timestamps.
-3. Split `probed` from full preprocess so metadata can return immediately after `schedule_item` is built.
-4. Add a transport/count bypass policy for local_path/base64 single-image or cheap cases.
-5. Investigate large tensor payload movement separately in the model-worker `fetch_ready()` path.
+1. Reduce model-worker tensor payload transfer/materialization overhead for `pixel_values`.
+2. Add request-body pre-counting so descriptor-only dummy can also skip the first image in multi-image requests while still preserving single-image native bypass.
+3. Investigate why local_path/base64 still trigger local fallback in some measured worker paths.
+4. Keep the single-image bypass policy enabled by default and expand it only if real traffic shows 2-image cheap cases are also slower.
+5. Continue output-contract hardening for 20-image strict runs; loose visual semantics are already clean.
