@@ -152,7 +152,15 @@ class VllmPatchApiFastPathTests(unittest.TestCase):
         self.assertEqual(len(result["mm_placeholders"]["image"]), 1)
         item = result["mm_kwargs"]["image"][0]
         self.assertTrue(is_synthetic_qwen_mm_kwargs_item(item))
-        self.assertIs(get_request_payload_from_qwen_mm_kwargs_item(item), capture.sidecar_prepare)
+        attached_payload = get_request_payload_from_qwen_mm_kwargs_item(item)
+        self.assertIsNotNone(attached_payload)
+        assert attached_payload is not None
+        self.assertEqual(attached_payload["prepared_image_count"], 1)
+        self.assertEqual(attached_payload["handles"], capture.sidecar_prepare["handles"])
+        self.assertEqual(
+            attached_payload["planned_items"],
+            capture.sidecar_prepare["planned_items"],
+        )
         self.assertEqual(tuple(item["pixel_values"].data.shape), (0, 1176))
         self.assertEqual(item["image_grid_thw"].data.tolist(), [1, 36, 20])
         self.assertIs(processor.seen_mm_kwargs, result["mm_kwargs"])
