@@ -55,6 +55,8 @@ def _timing_diagnostics(timings: dict[str, float] | None) -> dict[str, float]:
         "manager_ready_receive_to_apply_ms": "manager_ready_receive_to_apply_ms",
         "manager_ready_apply_total_ms": "manager_ready_apply_total_ms",
         "manager_cache_put_ms": "manager_cache_put_ms",
+        "worker_to_manager_receive_ms": "worker_to_manager_receive_ms",
+        "worker_to_manager_cache_done_ms": "worker_to_manager_cache_done_ms",
     }
     diagnostics: dict[str, float] = {}
     for source_key, diagnostic_key in mapping.items():
@@ -764,6 +766,11 @@ class SidecarManager:
                     0.0,
                     apply_start_at_ms - put_start_at_ms,
                 )
+                if received_at_ms is not None:
+                    ready_timings["worker_to_manager_receive_ms"] = max(
+                        0.0,
+                        received_at_ms - put_start_at_ms,
+                    )
             put_done_at_ms = _float_timing(
                 ready_timings,
                 "worker_ready_put_done_at_ms",
@@ -780,6 +787,11 @@ class SidecarManager:
                 0.0,
                 cache_put_finished_ms - cache_put_started_ms,
             )
+            if put_start_at_ms is not None:
+                ready_timings["worker_to_manager_cache_done_ms"] = max(
+                    0.0,
+                    cache_put_finished_ms - put_start_at_ms,
+                )
             ready_timings["manager_ready_apply_total_ms"] = max(
                 0.0,
                 cache_put_finished_ms - apply_start_at_ms,
