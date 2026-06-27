@@ -268,16 +268,14 @@ class SidecarFallbackCoordinator:
 
         sidecar_artifacts: list[PreparedArtifact] = []
         fallback_descriptors: list[FallbackDescriptor] = []
+        ready_entries = tuple(
+            entry
+            for entry in plan.entries
+            if entry.decision is SourcePlanDecision.USE_SIDECAR
+        )
+        sidecar_artifacts.extend(self._fetch_ready_entries(ready_entries))
         for entry in plan.entries:
             if entry.decision is SourcePlanDecision.USE_SIDECAR:
-                if self._manager is None or entry.handle is None:
-                    raise RuntimeError("sidecar fetch requested without manager/handle")
-                artifact = self._manager.fetch_ready(entry.handle)
-                if artifact is None:
-                    raise RuntimeError(
-                        f"sidecar artifact missing for media index {entry.request_media_index}"
-                    )
-                sidecar_artifacts.append(artifact)
                 continue
 
             descriptor = descriptor_by_index.get(entry.request_media_index)
@@ -303,6 +301,44 @@ class SidecarFallbackCoordinator:
                 )
             ),
         )
+
+    def _fetch_ready_entries(
+        self,
+        entries: tuple[SourcePlanEntry, ...],
+    ) -> tuple[PreparedArtifact, ...]:
+        if not entries:
+            return ()
+        if self._manager is None:
+            raise RuntimeError("sidecar fetch requested without manager")
+
+        handles: list[SidecarHandle] = []
+        for entry in entries:
+            if entry.handle is None:
+                raise RuntimeError(
+                    "sidecar ready entry missing handle for "
+                    f"media index {entry.request_media_index}"
+                )
+            handles.append(entry.handle)
+
+        batch_fetch = getattr(self._manager, "fetch_ready_batch", None)
+        if callable(batch_fetch):
+            artifacts = tuple(batch_fetch(handles))
+        else:
+            artifacts = tuple(self._manager.fetch_ready(handle) for handle in handles)
+        if len(artifacts) != len(entries):
+            raise RuntimeError(
+                "sidecar batch fetch returned unexpected artifact count: "
+                f"expected={len(entries)} actual={len(artifacts)}"
+            )
+
+        ready_artifacts: list[PreparedArtifact] = []
+        for entry, artifact in zip(entries, artifacts):
+            if artifact is None:
+                raise RuntimeError(
+                    f"sidecar artifact missing for media index {entry.request_media_index}"
+                )
+            ready_artifacts.append(artifact)
+        return tuple(ready_artifacts)
 
     def _build_fail_open_plan(
         self,

@@ -143,6 +143,58 @@ class SidecarServiceTests(unittest.TestCase):
                     service.join(timeout=2.0)
                     service.terminate()
 
+    def test_service_fetch_ready_batch_returns_ordered_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            image_paths = [
+                Path(tmpdir) / "service-batch-0.jpg",
+                Path(tmpdir) / "service-batch-1.jpg",
+            ]
+            for image_path in image_paths:
+                image_path.write_bytes(_make_jpeg_bytes())
+            service = SidecarServiceProcess(
+                SidecarServiceConfig(
+                    worker_pool_mode="inline",
+                    manager=SidecarManagerConfig(
+                        cache=MemoryCacheConfig(max_reusable_bytes=16 * 1024 * 1024),
+                        workers=WorkerPoolConfig(worker_count=1),
+                    ),
+                )
+            )
+            client = service.start()
+            try:
+                descriptors = [
+                    _build_local_descriptor(image_path, index)
+                    for index, image_path in enumerate(image_paths)
+                ]
+                handles = client.prepare(descriptors)
+                ready = client.wait_for_states(handles, {SidecarState.READY}, 500.0)
+                self.assertEqual([snapshot.state for snapshot in ready], [SidecarState.READY] * 2)
+
+                artifacts = client.fetch_ready_batch(handles)
+                self.assertEqual(len(artifacts), 2)
+                self.assertTrue(all(artifact is not None for artifact in artifacts))
+                self.assertEqual(
+                    [artifact.handle.request_media_index for artifact in artifacts if artifact is not None],
+                    [0, 1],
+                )
+                batch_count = 0.0
+                for artifact in artifacts:
+                    assert artifact is not None
+                    self.assertEqual(artifact.payload.image_grid_thw, (1, 36, 20))
+                    self.assertIsNotNone(artifact.fetch_diagnostics_ms)
+                    assert artifact.fetch_diagnostics_ms is not None
+                    self.assertIn("client_rpc_total", artifact.fetch_diagnostics_ms)
+                    self.assertIn("client_rpc_batch_count", artifact.fetch_diagnostics_ms)
+                    self.assertIn("manager_fetch_batch_count", artifact.fetch_diagnostics_ms)
+                    batch_count += artifact.fetch_diagnostics_ms["client_rpc_batch_count"]
+                self.assertAlmostEqual(batch_count, 1.0)
+            finally:
+                try:
+                    client.shutdown()
+                finally:
+                    service.join(timeout=2.0)
+                    service.terminate()
+
     def test_service_process_worker_pool_can_spawn_workers(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             image_path = Path(tmpdir) / "service-process.jpg"

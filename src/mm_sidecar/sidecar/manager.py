@@ -225,96 +225,140 @@ class SidecarManager:
             time.sleep(poll_interval_ms / 1000.0)
 
     def fetch_ready(self, handle: SidecarHandle) -> PreparedArtifact | None:
+        artifacts = self.fetch_ready_batch([handle])
+        return artifacts[0] if artifacts else None
+
+    def fetch_ready_batch(
+        self,
+        handles: list[SidecarHandle] | tuple[SidecarHandle, ...],
+    ) -> tuple[PreparedArtifact | None, ...]:
         fetch_started_ms = _now_ms()
         self._drain_ready_results()
         after_ready_drain_ms = _now_ms()
         self._drain_results()
         after_result_drain_ms = _now_ms()
+        shared_count = max(1, len(handles))
         with self._lock:
-            entry = self._entries.get(handle.cache_key)
-            if entry is None:
-                return None
-            self._refresh_ready_entry(entry)
-            if not self._handle_matches_entry(handle, entry):
-                return None
-            if entry.state not in {SidecarState.READY, SidecarState.FALLBACK_LOCAL_DONE}:
-                return None
-            if entry.epoch != handle.epoch:
-                return None
-            if entry.state is SidecarState.FALLBACK_LOCAL_DONE:
-                if (
-                    entry.artifact_descriptor is None
-                    or entry.fallback_local_payload is None
-                ):
-                    return None
-                cache_get_finished_ms = _now_ms()
-                entry.updated_at_ms = _now_ms()
-                return PreparedArtifact(
-                    handle=handle,
-                    descriptor=entry.artifact_descriptor,
-                    payload=entry.fallback_local_payload,
-                    timings_ms=(
-                        dict(entry.fallback_local_timings_ms)
-                        if entry.fallback_local_timings_ms is not None
-                        else (
-                            dict(entry.timings_ms)
-                            if entry.timings_ms is not None
-                            else None
-                        )
-                    ),
-                    fetch_diagnostics_ms={
-                        "manager_fetch_total": max(0.0, _now_ms() - fetch_started_ms),
-                        "manager_ready_drain": max(
-                            0.0,
-                            after_ready_drain_ms - fetch_started_ms,
-                        ),
-                        "manager_result_drain": max(
-                            0.0,
-                            after_result_drain_ms - after_ready_drain_ms,
-                        ),
-                        "manager_cache_get": 0.0,
-                        "manager_post_cache": max(
-                            0.0,
-                            _now_ms() - cache_get_finished_ms,
-                        ),
-                        "manager_local_payload": 1.0,
-                    },
+            return tuple(
+                self._fetch_ready_locked(
+                    handle,
+                    fetch_started_ms=fetch_started_ms,
+                    after_ready_drain_ms=after_ready_drain_ms,
+                    after_result_drain_ms=after_result_drain_ms,
+                    shared_count=shared_count,
                 )
-            cache_get_started_ms = _now_ms()
-            cached = self._cache_pool.get(handle.cache_key)
-            cache_get_finished_ms = _now_ms()
-            if cached is None:
-                entry.state = SidecarState.EXPIRED
-                entry.updated_at_ms = _now_ms()
+                for handle in handles
+            )
+
+    def _fetch_ready_locked(
+        self,
+        handle: SidecarHandle,
+        *,
+        fetch_started_ms: float,
+        after_ready_drain_ms: float,
+        after_result_drain_ms: float,
+        shared_count: int,
+    ) -> PreparedArtifact | None:
+        entry = self._entries.get(handle.cache_key)
+        if entry is None:
+            return None
+        self._refresh_ready_entry(entry)
+        if not self._handle_matches_entry(handle, entry):
+            return None
+        if entry.state not in {SidecarState.READY, SidecarState.FALLBACK_LOCAL_DONE}:
+            return None
+        if entry.epoch != handle.epoch:
+            return None
+        if entry.state is SidecarState.FALLBACK_LOCAL_DONE:
+            if (
+                entry.artifact_descriptor is None
+                or entry.fallback_local_payload is None
+            ):
                 return None
-            descriptor, payload = cached
-            entry.artifact_descriptor = descriptor
+            cache_get_finished_ms = _now_ms()
             entry.updated_at_ms = _now_ms()
             return PreparedArtifact(
                 handle=handle,
-                descriptor=descriptor,
-                payload=payload,
-                timings_ms=dict(entry.timings_ms) if entry.timings_ms is not None else None,
+                descriptor=entry.artifact_descriptor,
+                payload=entry.fallback_local_payload,
+                timings_ms=(
+                    dict(entry.fallback_local_timings_ms)
+                    if entry.fallback_local_timings_ms is not None
+                    else (
+                        dict(entry.timings_ms)
+                        if entry.timings_ms is not None
+                        else None
+                    )
+                ),
                 fetch_diagnostics_ms={
-                    "manager_fetch_total": max(0.0, _now_ms() - fetch_started_ms),
+                    "manager_fetch_total": max(
+                        0.0,
+                        _now_ms() - fetch_started_ms,
+                    )
+                    / shared_count,
                     "manager_ready_drain": max(
                         0.0,
                         after_ready_drain_ms - fetch_started_ms,
-                    ),
+                    )
+                    / shared_count,
                     "manager_result_drain": max(
                         0.0,
                         after_result_drain_ms - after_ready_drain_ms,
-                    ),
-                    "manager_cache_get": max(
-                        0.0,
-                        cache_get_finished_ms - cache_get_started_ms,
-                    ),
+                    )
+                    / shared_count,
+                    "manager_cache_get": 0.0,
                     "manager_post_cache": max(
                         0.0,
                         _now_ms() - cache_get_finished_ms,
                     ),
+                    "manager_fetch_batch_count": 1.0 / shared_count,
+                    "manager_fetch_batch_items": 1.0,
+                    "manager_local_payload": 1.0,
                 },
             )
+        cache_get_started_ms = _now_ms()
+        cached = self._cache_pool.get(handle.cache_key)
+        cache_get_finished_ms = _now_ms()
+        if cached is None:
+            entry.state = SidecarState.EXPIRED
+            entry.updated_at_ms = _now_ms()
+            return None
+        descriptor, payload = cached
+        entry.artifact_descriptor = descriptor
+        entry.updated_at_ms = _now_ms()
+        return PreparedArtifact(
+            handle=handle,
+            descriptor=descriptor,
+            payload=payload,
+            timings_ms=dict(entry.timings_ms) if entry.timings_ms is not None else None,
+            fetch_diagnostics_ms={
+                "manager_fetch_total": max(
+                    0.0,
+                    _now_ms() - fetch_started_ms,
+                )
+                / shared_count,
+                "manager_ready_drain": max(
+                    0.0,
+                    after_ready_drain_ms - fetch_started_ms,
+                )
+                / shared_count,
+                "manager_result_drain": max(
+                    0.0,
+                    after_result_drain_ms - after_ready_drain_ms,
+                )
+                / shared_count,
+                "manager_cache_get": max(
+                    0.0,
+                    cache_get_finished_ms - cache_get_started_ms,
+                ),
+                "manager_post_cache": max(
+                    0.0,
+                    _now_ms() - cache_get_finished_ms,
+                ),
+                "manager_fetch_batch_count": 1.0 / shared_count,
+                "manager_fetch_batch_items": 1.0,
+            },
+        )
 
     def try_fallback_claim(
         self,

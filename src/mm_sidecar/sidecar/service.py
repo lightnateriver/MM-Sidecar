@@ -322,6 +322,24 @@ class SidecarClient:
                 object.__setattr__(result, "fetch_diagnostics_ms", merged)
             except Exception:
                 pass
+        if method_name == "fetch_ready_batch" and result is not None:
+            artifacts = tuple(artifact for artifact in result if artifact is not None)
+            artifact_count = max(1, len(artifacts))
+            per_artifact_rpc_ms = max(
+                0.0,
+                _now_perf_ms() - request_started_ms,
+            ) / artifact_count
+            per_artifact_batch_count = 1.0 / artifact_count
+            for artifact in artifacts:
+                diagnostics = getattr(artifact, "fetch_diagnostics_ms", None)
+                merged = dict(diagnostics) if isinstance(diagnostics, dict) else {}
+                merged["client_rpc_total"] = per_artifact_rpc_ms
+                merged["client_rpc_batch_count"] = per_artifact_batch_count
+                merged["client_rpc_batch_items"] = 1.0
+                try:
+                    object.__setattr__(artifact, "fetch_diagnostics_ms", merged)
+                except Exception:
+                    pass
         return result
 
     def prepare(self, descriptors: list[Any] | tuple[Any, ...]):
@@ -363,6 +381,9 @@ class SidecarClient:
 
     def fetch_ready(self, handle: Any):
         return self._request("fetch_ready", handle)
+
+    def fetch_ready_batch(self, handles: list[Any] | tuple[Any, ...]):
+        return self._request("fetch_ready_batch", handles)
 
     def try_fallback_claim(
         self,

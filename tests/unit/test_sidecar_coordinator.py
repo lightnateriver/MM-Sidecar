@@ -129,6 +129,21 @@ class _ManualWorkerPool:
         self._results.clear()
 
 
+class _BatchCountingSidecarManager(SidecarManager):
+    def __init__(self) -> None:
+        super().__init__(worker_pool=InlineProcessorWorkerPool())
+        self.fetch_ready_batch_calls = 0
+        self.fetch_ready_calls = 0
+
+    def fetch_ready_batch(self, handles):
+        self.fetch_ready_batch_calls += 1
+        return super().fetch_ready_batch(handles)
+
+    def fetch_ready(self, handle):
+        self.fetch_ready_calls += 1
+        return super().fetch_ready(handle)
+
+
 class SidecarCoordinatorTests(unittest.TestCase):
     def test_fetch_according_to_plan_uses_sidecar_when_ready(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -155,6 +170,44 @@ class SidecarCoordinatorTests(unittest.TestCase):
             self.assertEqual(len(batch.sidecar_artifacts), 1)
             self.assertEqual(len(batch.fallback_descriptors), 0)
             self.assertEqual(batch.source_plan.entries[0].decision, SourcePlanDecision.USE_SIDECAR)
+            manager.close()
+
+    def test_fetch_according_to_plan_batches_ready_sidecar_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            image_paths = [
+                Path(tmpdir) / "ready-batch-0.jpg",
+                Path(tmpdir) / "ready-batch-1.jpg",
+            ]
+            for image_path in image_paths:
+                image_path.write_bytes(_make_jpeg_bytes())
+
+            manager = _BatchCountingSidecarManager()
+            descriptors = [
+                _make_descriptor(image_path, "req-ready-batch", index)
+                for index, image_path in enumerate(image_paths)
+            ]
+            handles = manager.prepare(descriptors)
+            snapshots = manager.wait_for_states(handles, {SidecarState.READY}, 500.0)
+            self.assertEqual([snapshot.state for snapshot in snapshots], [SidecarState.READY] * 2)
+
+            coordinator = SidecarFallbackCoordinator(
+                manager=manager,
+                claimer_id="rank-0",
+                producer_rank=0,
+                near_ready_wait_ms=0.0,
+            )
+            batch = coordinator.fetch_according_to_plan(
+                descriptors=descriptors,
+                handles=list(handles),
+            )
+
+            self.assertEqual(manager.fetch_ready_batch_calls, 1)
+            self.assertEqual(manager.fetch_ready_calls, 0)
+            self.assertEqual(
+                [artifact.handle.request_media_index for artifact in batch.sidecar_artifacts],
+                [0, 1],
+            )
+            self.assertEqual(len(batch.fallback_descriptors), 0)
             manager.close()
 
     def test_build_source_plan_claims_fallback_when_not_ready(self) -> None:
