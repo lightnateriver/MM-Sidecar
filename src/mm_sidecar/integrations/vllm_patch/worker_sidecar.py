@@ -1651,6 +1651,7 @@ def _sidecar_or_fallback_items_for_plan(
     *,
     role: TpWorkerRole,
 ) -> tuple[list[Any], dict[str, float]]:
+    total_start = time.perf_counter()
     local_request_media_ids = [
         int(plan.image_input_ids[local_idx]) for local_idx in plan.local_indices
     ]
@@ -1677,9 +1678,26 @@ def _sidecar_or_fallback_items_for_plan(
     diagnostics: dict[str, float] = {}
     artifacts: list[Any] = []
     if client is None or not plan.binding.enabled:
+        fallback_start = time.perf_counter()
         artifacts.extend(_run_local_fallback_artifacts(local_descriptors))
+        diagnostics["local_fallback_ms"] = (
+            time.perf_counter() - fallback_start
+        ) * 1000.0
+        diagnostics.update(_merge_fetch_diagnostics(artifacts))
+        diagnostics["payload_bytes"] = float(_artifact_payload_bytes(artifacts))
+        diagnostics["artifact_count"] = float(len(artifacts))
+        convert_start = time.perf_counter()
+        items = [
+            sidecar_artifact_to_qwen_mm_kwargs_item(artifact) for artifact in artifacts
+        ]
+        diagnostics["artifact_to_mm_kwargs_ms"] = (
+            time.perf_counter() - convert_start
+        ) * 1000.0
+        diagnostics["worker_fetch_total_ms"] = (
+            time.perf_counter() - total_start
+        ) * 1000.0
         return (
-            [sidecar_artifact_to_qwen_mm_kwargs_item(artifact) for artifact in artifacts],
+            items,
             diagnostics,
         )
 
@@ -1695,16 +1713,22 @@ def _sidecar_or_fallback_items_for_plan(
         fallback_wait_ms=_remote_fallback_wait_ms(),
         observe_plan_wait_ms=_peer_plan_wait_ms(),
     )
+    fetch_start = time.perf_counter()
     fetch_batch = coordinator.fetch_according_to_plan(
         descriptors=local_descriptors,
         handles=local_handles,
         source_plan=plan.source_plan,
     )
+    diagnostics["fetch_ms"] = (time.perf_counter() - fetch_start) * 1000.0
     artifacts.extend(fetch_batch.sidecar_artifacts)
     if fetch_batch.fallback_descriptors:
+        fallback_start = time.perf_counter()
         local_fallback_artifacts = _run_local_fallback_artifacts(
             fetch_batch.fallback_descriptors,
         )
+        diagnostics["local_fallback_ms"] = (
+            time.perf_counter() - fallback_start
+        ) * 1000.0
         if role.world_size > 1:
             _publish_local_fallback_artifacts(
                 client,
@@ -1723,12 +1747,20 @@ def _sidecar_or_fallback_items_for_plan(
     artifact_by_index = {
         int(artifact.handle.request_media_index): artifact for artifact in artifacts
     }
+    convert_start = time.perf_counter()
+    items = [
+        sidecar_artifact_to_qwen_mm_kwargs_item(artifact_by_index[item_id])
+        for item_id in local_request_media_ids
+        if item_id in artifact_by_index
+    ]
+    diagnostics["artifact_to_mm_kwargs_ms"] = (
+        time.perf_counter() - convert_start
+    ) * 1000.0
+    diagnostics["worker_fetch_total_ms"] = (
+        time.perf_counter() - total_start
+    ) * 1000.0
     return (
-        [
-            sidecar_artifact_to_qwen_mm_kwargs_item(artifact_by_index[item_id])
-            for item_id in local_request_media_ids
-            if item_id in artifact_by_index
-        ],
+        items,
         diagnostics,
     )
 
@@ -1764,6 +1796,7 @@ def _fetch_vit_dp_shard_pixel_values(
     if not image_idxs_local:
         return [], {}
 
+    total_start = time.perf_counter()
     local_items = tuple(items[index] for index in image_idxs_local)
     descriptors = [item.descriptor for item in local_items]
     handles = [item.handle for item in local_items]
@@ -1772,7 +1805,11 @@ def _fetch_vit_dp_shard_pixel_values(
     artifacts: list[Any] = []
 
     if client is None:
+        fallback_start = time.perf_counter()
         artifacts.extend(_run_local_fallback_artifacts(descriptors))
+        diagnostics["local_fallback_ms"] = (
+            time.perf_counter() - fallback_start
+        ) * 1000.0
     else:
         coordinator = SidecarFallbackCoordinator(
             manager=client,
@@ -1786,25 +1823,36 @@ def _fetch_vit_dp_shard_pixel_values(
             fallback_wait_ms=_remote_fallback_wait_ms(),
             observe_plan_wait_ms=_peer_plan_wait_ms(),
         )
+        source_plan_start = time.perf_counter()
         source_plan = coordinator.build_source_plan(
             descriptors=descriptors,
             handles=handles,
             claim=False,
             wait_for_ready=True,
         )
+        diagnostics["source_plan_ms"] = (
+            time.perf_counter() - source_plan_start
+        ) * 1000.0
+        fetch_start = time.perf_counter()
         fetch_batch = coordinator.fetch_according_to_plan(
             descriptors=descriptors,
             handles=handles,
             source_plan=source_plan,
         )
+        diagnostics["fetch_ms"] = (time.perf_counter() - fetch_start) * 1000.0
         artifacts.extend(fetch_batch.sidecar_artifacts)
         if fetch_batch.fallback_descriptors:
+            fallback_start = time.perf_counter()
             artifacts.extend(_run_local_fallback_artifacts(fetch_batch.fallback_descriptors))
+            diagnostics["local_fallback_ms"] = (
+                time.perf_counter() - fallback_start
+            ) * 1000.0
 
     artifact_by_index = {
         int(artifact.handle.request_media_index): artifact for artifact in artifacts
     }
     pixel_tensors: list[Any] = []
+    tensor_start = time.perf_counter()
     for item in local_items:
         artifact = artifact_by_index.get(item.request_media_index)
         if artifact is None:
@@ -1818,11 +1866,17 @@ def _fetch_vit_dp_shard_pixel_values(
                 reference_pixel_values=reference_pixel_values,
             )
         )
+    diagnostics["artifact_to_tensor_ms"] = (
+        time.perf_counter() - tensor_start
+    ) * 1000.0
 
     diagnostics.update(_merge_fetch_diagnostics(artifacts))
     diagnostics["payload_bytes"] = float(_artifact_payload_bytes(artifacts))
     diagnostics["artifact_count"] = float(len(artifacts))
     diagnostics["local_image_count"] = float(len(local_items))
+    diagnostics["worker_fetch_total_ms"] = (
+        time.perf_counter() - total_start
+    ) * 1000.0
     for item in local_items:
         setattr(item.req_state, "mm_sidecar_last_fetch_profile_ms", diagnostics)
     return pixel_tensors, diagnostics
@@ -1843,10 +1897,12 @@ def _run_dp_sharded_mrope_vision_model_with_sidecar(
 
     from vllm.distributed import tensor_model_parallel_all_gather
 
+    total_start = time.perf_counter()
     role = context.role
     tp_size = role.world_size
     tp_rank_local = role.local_rank
 
+    assignment_start = time.perf_counter()
     patches_per_image = [math.prod(grid_thw) for grid_thw in grid_thw_list]
     image_to_tp_rank, gpu_sample_counts, grouped_pixel_values_len = (
         vision_module.get_load_balance_assignment(patches_per_image, tp_size)
@@ -1855,13 +1911,21 @@ def _run_dp_sharded_mrope_vision_model_with_sidecar(
     image_idxs_local = image_to_tp_rank[
         cum_gpu_sample_counts[tp_rank_local] : cum_gpu_sample_counts[tp_rank_local + 1]
     ]
+    assignment_ms = (time.perf_counter() - assignment_start) * 1000.0
 
+    fetch_call_start = time.perf_counter()
     pixel_tensors, diagnostics = _fetch_vit_dp_shard_pixel_values(
         context_items,
         image_idxs_local,
         role=role,
         reference_pixel_values=pixel_values,
     )
+    diagnostics["vit_dp_fetch_call_ms"] = (
+        time.perf_counter() - fetch_call_start
+    ) * 1000.0
+    diagnostics["vit_dp_assignment_ms"] = assignment_ms
+
+    concat_start = time.perf_counter()
     if pixel_tensors:
         pixel_values_local = torch.cat(pixel_tensors, dim=0)
     else:
@@ -1870,6 +1934,9 @@ def _run_dp_sharded_mrope_vision_model_with_sidecar(
             device=pixel_values.device,
             dtype=pixel_values.dtype,
         )
+    diagnostics["vit_dp_pixel_concat_ms"] = (
+        time.perf_counter() - concat_start
+    ) * 1000.0
 
     if rope_type == "rope_2d":
         embed_dim_reduction_factor = (
@@ -1883,6 +1950,7 @@ def _run_dp_sharded_mrope_vision_model_with_sidecar(
     max_len_per_rank = max(grouped_pixel_values_len) // embed_dim_reduction_factor
     local_grid_thw_list = [grid_thw_list[i] for i in image_idxs_local]
 
+    vision_start = time.perf_counter()
     if rope_type == "rope_2d":
         if pixel_values_local.shape[0] > 0:
             image_embeds_local = vision_model(
@@ -1907,7 +1975,9 @@ def _run_dp_sharded_mrope_vision_model_with_sidecar(
                 device=pixel_values.device,
                 dtype=pixel_values.dtype,
             )
+    diagnostics["vit_dp_vision_ms"] = (time.perf_counter() - vision_start) * 1000.0
 
+    gather_start = time.perf_counter()
     current_len = image_embeds_local.shape[0]
     if current_len < max_len_per_rank:
         padding_size = max_len_per_rank - current_len
@@ -1935,7 +2005,11 @@ def _run_dp_sharded_mrope_vision_model_with_sidecar(
         image_embeds_local_padded,
         dim=0,
     )
+    diagnostics["vit_dp_all_gather_ms"] = (
+        time.perf_counter() - gather_start
+    ) * 1000.0
 
+    reconstruct_start = time.perf_counter()
     rank_embeddings = list[Any]()
     for rank in range(tp_size):
         start_idx = rank * max_len_per_rank
@@ -1970,6 +2044,10 @@ def _run_dp_sharded_mrope_vision_model_with_sidecar(
     if len(out_embeddings) != len(original_order_embeddings):
         raise RuntimeError("vit dp shard fetch found unassigned embeddings")
 
+    diagnostics["vit_dp_reconstruct_ms"] = (
+        time.perf_counter() - reconstruct_start
+    ) * 1000.0
+    diagnostics["vit_dp_total_ms"] = (time.perf_counter() - total_start) * 1000.0
     setattr(context.model_runner, "mm_sidecar_last_fetch_profile_ms", diagnostics)
     setattr(
         context.model_runner,
@@ -1980,14 +2058,22 @@ def _run_dp_sharded_mrope_vision_model_with_sidecar(
             "local_indices": tuple(int(index) for index in image_idxs_local),
             "total_images": len(grid_thw_list),
             "payload_bytes": diagnostics.get("payload_bytes", 0.0),
+            "timings_ms": dict(diagnostics),
         },
     )
+    debug_extra = ""
+    if _worker_fetch_profile_enabled():
+        debug_extra = " " + " ".join(
+            f"{key}={value:.3f}"
+            for key, value in sorted(diagnostics.items())
+        )
     _emit_worker_debug(
         "vit_dp_shard_fetch "
         f"rank={role.local_rank}/{role.world_size} "
         f"local_indices={list(image_idxs_local)} "
         f"total_images={len(grid_thw_list)} "
         f"payload_bytes={diagnostics.get('payload_bytes', 0.0):.0f}"
+        f"{debug_extra}"
     )
     return out_embeddings
 
@@ -2210,6 +2296,7 @@ def _try_execute_vit_dp_sidecar_direct_encode(
     ] = []
 
     for req_id, image_input_ids in scheduled_encoder_inputs.items():
+        request_start = time.perf_counter()
         image_input_ids_list = list(image_input_ids)
         req_state = getattr(model_runner, "requests", {}).get(req_id)
         plan = None
@@ -2219,6 +2306,7 @@ def _try_execute_vit_dp_sidecar_direct_encode(
         error: Exception | None = None
         if req_state is not None:
             try:
+                plan_start = time.perf_counter()
                 plan = _build_vit_dp_execution_plan_for_request(
                     model_runner,
                     req_id,
@@ -2226,11 +2314,19 @@ def _try_execute_vit_dp_sidecar_direct_encode(
                     image_input_ids_list,
                     role=role,
                 )
+                direct_plan_ms = (time.perf_counter() - plan_start) * 1000.0
+                diagnostics["direct_plan_ms"] = direct_plan_ms
                 if plan is not None:
+                    items_start = time.perf_counter()
                     local_items, diagnostics = _sidecar_or_fallback_items_for_plan(
                         plan,
                         role=role,
                     )
+                    diagnostics = dict(diagnostics)
+                    diagnostics["direct_plan_ms"] = direct_plan_ms
+                    diagnostics["direct_sidecar_items_ms"] = (
+                        time.perf_counter() - items_start
+                    ) * 1000.0
                     if len(local_items) != len(plan.local_indices):
                         raise RuntimeError(
                             "local direct encode item count mismatch: "
@@ -2241,7 +2337,16 @@ def _try_execute_vit_dp_sidecar_direct_encode(
             except Exception as exc:
                 error = exc
 
+        barrier_start = time.perf_counter()
         all_ready = _all_tp_ranks_ready_for_direct_encode(ready, role=role)
+        diagnostics["direct_ready_barrier_ms"] = (
+            time.perf_counter() - barrier_start
+        ) * 1000.0
+        diagnostics["direct_prepare_total_ms"] = (
+            time.perf_counter() - request_start
+        ) * 1000.0
+        if req_state is not None:
+            setattr(req_state, "mm_sidecar_last_fetch_profile_ms", diagnostics)
         if not all_ready or plan is None:
             if shard_fetch_direct_requested:
                 if error is not None:
@@ -2274,7 +2379,9 @@ def _try_execute_vit_dp_sidecar_direct_encode(
         ready_requests.append((req_id, req_state, plan, local_items, diagnostics))
 
     for req_id, req_state, plan, local_items, diagnostics in ready_requests:
+        execute_start = time.perf_counter()
         try:
+            encode_start = time.perf_counter()
             gathered_outputs = _manual_encode_and_gather_local_items(
                 model_runner,
                 image_features=plan.image_features,
@@ -2283,6 +2390,9 @@ def _try_execute_vit_dp_sidecar_direct_encode(
                 order=plan.order,
                 counts=plan.counts,
             )
+            diagnostics["direct_manual_encode_gather_ms"] = (
+                time.perf_counter() - encode_start
+            ) * 1000.0
         except Exception as exc:
             _append_runner_error(
                 model_runner,
@@ -2290,6 +2400,7 @@ def _try_execute_vit_dp_sidecar_direct_encode(
                 f"{req_id}: {exc.__class__.__name__}: {exc}",
             )
             raise
+        cache_start = time.perf_counter()
         for feature, encoder_output in zip(plan.image_features, gathered_outputs):
             clone = getattr(encoder_output, "clone", None)
             if callable(clone):
@@ -2301,14 +2412,28 @@ def _try_execute_vit_dp_sidecar_direct_encode(
             maybe_save = getattr(model_runner, "maybe_save_ec_to_connector", None)
             if callable(maybe_save):
                 maybe_save(model_runner.encoder_cache, feature.identifier)
+        diagnostics["direct_cache_write_ms"] = (
+            time.perf_counter() - cache_start
+        ) * 1000.0
+        diagnostics["direct_execute_total_ms"] = (
+            time.perf_counter() - execute_start
+        ) * 1000.0
         setattr(req_state, "mm_sidecar_last_fetch_profile_ms", diagnostics)
+        setattr(model_runner, "mm_sidecar_last_fetch_profile_ms", diagnostics)
         handled_reqs.append(req_id)
+        debug_extra = ""
+        if _worker_fetch_profile_enabled():
+            debug_extra = " " + " ".join(
+                f"{key}={value:.3f}"
+                for key, value in sorted(diagnostics.items())
+            )
         _emit_worker_debug(
             f"req={plan.binding.request_id} "
             f"{'shard_fetch_direct_encode' if shard_fetch_direct_requested else 'direct_encode'} "
             f"rank={role.local_rank}/{role.world_size} "
             f"local_indices={list(plan.local_indices)} "
             f"total_images={len(plan.image_features)}"
+            f"{debug_extra}"
         )
 
     if handled_reqs or fallback_scheduled:

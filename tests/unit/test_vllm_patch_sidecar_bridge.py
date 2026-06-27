@@ -254,11 +254,16 @@ class VllmPatchSidecarBridgeTests(unittest.TestCase):
             )
             capture.add_normalized_image(0, "uuid-local-prepare", normalized)
 
-            payload = prepare_capture_for_sidecar(
-                capture=capture,
-                renderer=_FakeRenderer(),
-                params=_FakeParams(),
-            )
+            with mock.patch.dict(
+                os.environ,
+                {"MM_SIDECAR_MIN_IMAGE_COUNT": "1"},
+                clear=False,
+            ):
+                payload = prepare_capture_for_sidecar(
+                    capture=capture,
+                    renderer=_FakeRenderer(),
+                    params=_FakeParams(),
+                )
 
             self.assertIsNotNone(payload)
             assert payload is not None
@@ -272,6 +277,7 @@ class VllmPatchSidecarBridgeTests(unittest.TestCase):
             self.assertIsNone(payload["manager_stats"])
             self.assertIn("timings_ms", payload)
             self.assertGreaterEqual(payload["timings_ms"]["total"], 0.0)
+            self.assertGreaterEqual(payload["timings_ms"]["api_prepare_total"], 0.0)
             self.assertGreater(payload["total_placeholder_token_count"], 0)
             self.assertEqual(len(payload["handles"]), 1)
             self.assertEqual(len(payload["initial_statuses"]), 1)
@@ -287,6 +293,53 @@ class VllmPatchSidecarBridgeTests(unittest.TestCase):
             )
             self.assertIs(cached_payload, payload)
             manager.close()
+
+    def test_prepare_capture_for_sidecar_bypasses_single_image_by_default(self) -> None:
+        previous = os.environ.pop("MM_SIDECAR_MIN_IMAGE_COUNT", None)
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                image_path = Path(tmpdir) / "prepare-bypass.jpg"
+                _make_image().save(image_path, format="JPEG")
+
+                with Image.open(image_path) as image:
+                    normalized = build_normalized_image_from_url(
+                        image_url=f"file://{image_path}",
+                        image=image,
+                        media_uuid="uuid-local-bypass",
+                        request_scope_key="req-bypass",
+                        item_index=0,
+                    )
+
+                manager = SidecarManager(worker_pool=InlineProcessorWorkerPool())
+                capture = RequestCapture(
+                    request_id="req-bypass",
+                    method="POST",
+                    path="/v1/chat/completions",
+                    sidecar_manager=manager,
+                )
+                capture.add_normalized_image(0, "uuid-local-bypass", normalized)
+
+                payload = prepare_capture_for_sidecar(
+                    capture=capture,
+                    renderer=_FakeRenderer(),
+                    params=_FakeParams(),
+                )
+
+                self.assertIsNotNone(payload)
+                assert payload is not None
+                self.assertFalse(payload["enabled"])
+                self.assertEqual(payload["reason"], "image_count_below_min")
+                self.assertEqual(payload["prepared_image_count"], 1)
+                self.assertEqual(payload["min_image_count"], 2)
+                self.assertEqual(payload["handles"], [])
+                self.assertEqual(payload["initial_statuses"], [])
+                self.assertGreaterEqual(payload["timings_ms"]["api_prepare_total"], 0.0)
+                self.assertIsNone(capture.get_prepared_descriptor(0))
+                self.assertIsNone(capture.get_prepared_handle(0))
+                manager.close()
+        finally:
+            if previous is not None:
+                os.environ["MM_SIDECAR_MIN_IMAGE_COUNT"] = previous
 
     def test_prepare_capture_for_sidecar_uses_sidecar_metadata_without_normalized_image(self) -> None:
         manager = SidecarManager(worker_pool=InlineProcessorWorkerPool())
@@ -316,11 +369,16 @@ class VllmPatchSidecarBridgeTests(unittest.TestCase):
             ),
         )
 
-        payload = prepare_capture_for_sidecar(
-            capture=capture,
-            renderer=_FakeRenderer(),
-            params=_FakeParams(),
-        )
+        with mock.patch.dict(
+            os.environ,
+            {"MM_SIDECAR_MIN_IMAGE_COUNT": "1"},
+            clear=False,
+        ):
+            payload = prepare_capture_for_sidecar(
+                capture=capture,
+                renderer=_FakeRenderer(),
+                params=_FakeParams(),
+            )
 
         self.assertIsNotNone(payload)
         assert payload is not None

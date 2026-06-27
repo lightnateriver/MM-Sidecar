@@ -136,6 +136,15 @@ class _ManualWorkerPool:
 class VllmPatchWorkerSidecarTests(unittest.TestCase):
     def setUp(self) -> None:
         reset_worker_sidecar_client_cache()
+        self._env_patcher = mock.patch.dict(
+            os.environ,
+            {"MM_SIDECAR_MIN_IMAGE_COUNT": "1"},
+            clear=False,
+        )
+        self._env_patcher.start()
+
+    def tearDown(self) -> None:
+        self._env_patcher.stop()
 
     def test_bind_request_mm_sidecar_from_sampling_params(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

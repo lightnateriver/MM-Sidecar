@@ -44,6 +44,45 @@ def _safe_int(raw: str | None, default: int) -> int:
         return default
 
 
+def _min_image_count_for_sidecar() -> int:
+    return max(1, _safe_int(os.getenv("MM_SIDECAR_MIN_IMAGE_COUNT"), 2))
+
+
+def _capture_image_count(capture: RequestCapture) -> int:
+    seen: set[int] = set()
+    for item_index, _media_uuid, _image_ref in capture.iter_captured_image_refs():
+        seen.add(int(item_index))
+    for item_index, _media_uuid, _normalized_image in capture.iter_normalized_images():
+        seen.add(int(item_index))
+    return len(seen)
+
+
+def _base_prepare_timings(
+    *,
+    started_at: float,
+    descriptor_build_ms: float = 0.0,
+    descriptor_cache_ms: float = 0.0,
+    manager_prepare_ms: float = 0.0,
+    metadata_wait_total_ms: float = 0.0,
+    descriptor_only_metadata_retry_ms: float = 0.0,
+    source_plan_preview_ms: float = 0.0,
+    manager_stats_ms: float = 0.0,
+    manager_path_total_ms: float = 0.0,
+) -> dict[str, float]:
+    api_prepare_total_ms = (time.perf_counter() - started_at) * 1000.0
+    return {
+        "descriptor_build": descriptor_build_ms,
+        "descriptor_cache": descriptor_cache_ms,
+        "manager_prepare": manager_prepare_ms,
+        "batch_get_status": metadata_wait_total_ms,
+        "descriptor_only_metadata_retry": descriptor_only_metadata_retry_ms,
+        "source_plan_preview": source_plan_preview_ms,
+        "manager_stats": manager_stats_ms,
+        "total": manager_path_total_ms if manager_path_total_ms > 0.0 else api_prepare_total_ms,
+        "api_prepare_total": api_prepare_total_ms,
+    }
+
+
 def _available_cpu_ids() -> tuple[int, ...]:
     if hasattr(os, "sched_getaffinity"):
         cpu_ids = tuple(sorted(os.sched_getaffinity(0)))
@@ -108,6 +147,7 @@ def describe_sidecar_runtime_config() -> dict[str, Any]:
         "cpu_affinity_map": [list(item) for item in config.workers.cpu_affinity_map or ()],
         "reusable_cache_bytes": config.cache.max_reusable_bytes,
         "reusable_ttl_s": config.cache.reusable_entry_ttl_s,
+        "min_image_count": _min_image_count_for_sidecar(),
     }
 
 
@@ -678,16 +718,42 @@ def prepare_capture_for_sidecar(
     if capture.sidecar_prepare is not None:
         return capture.sidecar_prepare
 
-    if not capture.iter_captured_image_refs() and not capture.iter_normalized_images():
+    function_start = time.perf_counter()
+    image_count = _capture_image_count(capture)
+    if image_count <= 0:
         payload = {
             "enabled": True,
             "prepared_image_count": 0,
             "reason": "no_images_captured",
+            "timings_ms": _base_prepare_timings(started_at=function_start),
         }
         capture.set_sidecar_prepare(payload)
         return payload
 
+    manager = capture.sidecar_manager
+    min_image_count = _min_image_count_for_sidecar()
+    if manager is not None and image_count < min_image_count:
+        payload = {
+            "enabled": False,
+            "prepared_image_count": image_count,
+            "image_count": image_count,
+            "min_image_count": min_image_count,
+            "total_placeholder_token_count": 0,
+            "processor_signature": None,
+            "planned_items": [],
+            "source_plan_preview": None,
+            "handles": [],
+            "initial_statuses": [],
+            "reason": "image_count_below_min",
+            "timings_ms": _base_prepare_timings(started_at=function_start),
+            "manager_stats": None,
+        }
+        capture.set_sidecar_prepare(payload)
+        return payload
+
+    descriptor_start = time.perf_counter()
     descriptors = build_fallback_descriptors(capture, renderer, params)
+    after_descriptor_build = time.perf_counter()
     for descriptor in descriptors:
         if capture.get_prepared_descriptor(int(descriptor.request_media_index)) is None:
             capture.add_prepared_sidecar_item(
@@ -695,9 +761,12 @@ def prepare_capture_for_sidecar(
                 descriptor,
                 capture.get_prepared_handle(int(descriptor.request_media_index)),
             )
+    after_descriptor_cache = time.perf_counter()
+    descriptor_build_ms = (after_descriptor_build - descriptor_start) * 1000.0
+    descriptor_cache_ms = (after_descriptor_cache - after_descriptor_build) * 1000.0
 
-    manager = capture.sidecar_manager
     if manager is None:
+        source_plan_preview_start = time.perf_counter()
         planned_items = [
             _build_schedule_item(
                 item_index=item_index,
@@ -714,6 +783,9 @@ def prepare_capture_for_sidecar(
             near_ready_wait_ms=0.0,
         )
         source_plan_preview = coordinator.preview_source_plan(descriptors=descriptors)
+        source_plan_preview_ms = (
+            time.perf_counter() - source_plan_preview_start
+        ) * 1000.0
         payload = {
             "enabled": False,
             "prepared_image_count": len(descriptors),
@@ -728,14 +800,12 @@ def prepare_capture_for_sidecar(
             "handles": [],
             "initial_statuses": [],
             "reason": "sidecar_manager_unavailable",
-            "timings_ms": {
-                "manager_prepare": 0.0,
-                "batch_get_status": 0.0,
-                "descriptor_only_metadata_retry": 0.0,
-                "source_plan_preview": 0.0,
-                "manager_stats": 0.0,
-                "total": 0.0,
-            },
+            "timings_ms": _base_prepare_timings(
+                started_at=function_start,
+                descriptor_build_ms=descriptor_build_ms,
+                descriptor_cache_ms=descriptor_cache_ms,
+                source_plan_preview_ms=source_plan_preview_ms,
+            ),
             "manager_stats": None,
         }
         capture.set_sidecar_prepare(payload)
@@ -835,14 +905,15 @@ def prepare_capture_for_sidecar(
         "source_plan_preview": None,
         "handles": [_serialize_handle(handle) for handle in handles],
         "initial_statuses": [_serialize_snapshot(snapshot) for snapshot in snapshots],
-        "timings_ms": {
-            "manager_prepare": (after_prepare - prepare_start) * 1000.0,
-            "batch_get_status": metadata_wait_total_ms,
-            "descriptor_only_metadata_retry": descriptor_only_metadata_retry_ms,
-            "source_plan_preview": 0.0,
-            "manager_stats": 0.0,
-            "total": (after_status - prepare_start) * 1000.0,
-        },
+        "timings_ms": _base_prepare_timings(
+            started_at=function_start,
+            descriptor_build_ms=descriptor_build_ms,
+            descriptor_cache_ms=descriptor_cache_ms,
+            manager_prepare_ms=(after_prepare - prepare_start) * 1000.0,
+            metadata_wait_total_ms=metadata_wait_total_ms,
+            descriptor_only_metadata_retry_ms=descriptor_only_metadata_retry_ms,
+            manager_path_total_ms=(after_status - prepare_start) * 1000.0,
+        ),
         "manager_stats": None,
     }
     capture.set_sidecar_prepare(payload)

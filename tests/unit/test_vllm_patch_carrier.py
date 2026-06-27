@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import os
 import tempfile
 import unittest
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
+from unittest import mock
 
 from PIL import Image
 
@@ -87,7 +89,12 @@ class VllmPatchCarrierTests(unittest.TestCase):
                 sidecar_manager=manager,
             )
             capture.add_normalized_image(0, "uuid-carrier", normalized)
-            prepare_capture_for_sidecar(capture, _FakeRenderer(), _FakeParams())
+            with mock.patch.dict(
+                os.environ,
+                {"MM_SIDECAR_MIN_IMAGE_COUNT": "1"},
+                clear=False,
+            ):
+                prepare_capture_for_sidecar(capture, _FakeRenderer(), _FakeParams())
 
             params = _FakeParams()
             payload = attach_sidecar_payload_to_params(params, capture)
@@ -131,7 +138,12 @@ class VllmPatchCarrierTests(unittest.TestCase):
                 mm_processor_kwargs=_FakeParams.mm_processor_kwargs,
                 media_io_kwargs={},
             )
-            prepare_capture_for_sidecar(capture, _FakeRenderer(), params)
+            with mock.patch.dict(
+                os.environ,
+                {"MM_SIDECAR_MIN_IMAGE_COUNT": "1"},
+                clear=False,
+            ):
+                prepare_capture_for_sidecar(capture, _FakeRenderer(), params)
 
             payload = attach_sidecar_payload_to_params(params, capture)
 
