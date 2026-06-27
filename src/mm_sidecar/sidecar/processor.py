@@ -540,17 +540,41 @@ def _worker_main(
             )
             continue
         target_queue = ready_result_queue or result_queue
+        worker_ready_put_start_at_ms = _now_ms()
+        ready_timings_ms = {
+            **completed_timings_ms,
+            "worker_ready_put_start_at_ms": worker_ready_put_start_at_ms,
+            "worker_ready_payload_nbytes": float(payload.nbytes),
+        }
         target_queue.put(
             WorkerResult(
                 cache_key=task.cache_key,
                 epoch=task.epoch,
                 worker_id=worker_id,
                 event_type="ready",
-                at_ms=_now_ms(),
+                at_ms=worker_ready_put_start_at_ms,
                 schedule_item=schedule_item,
                 descriptor=descriptor,
                 payload=payload,
-                timings_ms=completed_timings_ms,
+                timings_ms=ready_timings_ms,
+            )
+        )
+        worker_ready_put_done_at_ms = _now_ms()
+        result_queue.put(
+            WorkerResult(
+                cache_key=task.cache_key,
+                epoch=task.epoch,
+                worker_id=worker_id,
+                event_type="ready_put_done",
+                at_ms=worker_ready_put_done_at_ms,
+                timings_ms={
+                    "worker_ready_put_start_at_ms": worker_ready_put_start_at_ms,
+                    "worker_ready_put_done_at_ms": worker_ready_put_done_at_ms,
+                    "worker_ready_put_call_ms": (
+                        worker_ready_put_done_at_ms - worker_ready_put_start_at_ms
+                    ),
+                    "worker_ready_payload_nbytes": float(payload.nbytes),
+                },
             )
         )
 
@@ -641,7 +665,11 @@ class InlineProcessorWorkerPool:
                 schedule_item=schedule_item,
                 descriptor=descriptor,
                 payload=payload,
-                timings_ms=completed_timings_ms,
+                timings_ms={
+                    **completed_timings_ms,
+                    "worker_ready_put_call_ms": 0.0,
+                    "worker_ready_payload_nbytes": float(payload.nbytes),
+                },
             )
         )
 

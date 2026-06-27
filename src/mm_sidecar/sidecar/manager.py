@@ -31,6 +31,39 @@ def _now_ms() -> float:
     return time.time() * 1000.0
 
 
+def _float_timing(timings: dict[str, float], key: str) -> float | None:
+    value = timings.get(key)
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _timing_diagnostics(timings: dict[str, float] | None) -> dict[str, float]:
+    if not timings:
+        return {}
+    mapping = {
+        "source": "worker_source_ms",
+        "decode": "worker_decode_ms",
+        "probe": "worker_probe_ms",
+        "preprocess": "worker_preprocess_ms",
+        "total": "worker_total_ms",
+        "worker_ready_put_call_ms": "worker_ready_put_call_ms",
+        "worker_ready_payload_nbytes": "worker_ready_payload_nbytes",
+        "manager_ready_queue_to_apply_ms": "manager_ready_queue_to_apply_ms",
+        "manager_ready_put_done_to_apply_ms": "manager_ready_put_done_to_apply_ms",
+        "manager_ready_receive_to_apply_ms": "manager_ready_receive_to_apply_ms",
+        "manager_ready_apply_total_ms": "manager_ready_apply_total_ms",
+        "manager_cache_put_ms": "manager_cache_put_ms",
+    }
+    diagnostics: dict[str, float] = {}
+    for source_key, diagnostic_key in mapping.items():
+        value = _float_timing(timings, source_key)
+        if value is not None:
+            diagnostics[diagnostic_key] = value
+    return diagnostics
+
+
 @dataclass(slots=True)
 class _ManagedEntry:
     descriptor: FallbackDescriptor
@@ -322,6 +355,7 @@ class SidecarManager:
                         _now_ms() - cache_get_finished_ms,
                     ),
                     "manager_local_payload": 1.0,
+                    **_timing_diagnostics(entry.fallback_local_timings_ms),
                     **(
                         {
                             "manager_fetch_batch_count": 1.0 / shared_count,
@@ -371,6 +405,7 @@ class SidecarManager:
                     0.0,
                     _now_ms() - cache_get_finished_ms,
                 ),
+                **_timing_diagnostics(entry.timings_ms),
                 **(
                     {
                         "manager_fetch_batch_count": 1.0 / shared_count,
@@ -606,9 +641,10 @@ class SidecarManager:
         results = self._worker_pool.poll()
         if not results:
             return
+        received_at_ms = _now_ms()
         with self._lock:
             for result in results:
-                self._apply_worker_result(result)
+                self._apply_worker_result(result, received_at_ms=received_at_ms)
 
     def _drain_ready_results(self, max_items: int | None = None) -> int:
         poll_ready = getattr(self._worker_pool, "poll_ready", None)
@@ -617,9 +653,10 @@ class SidecarManager:
         results = cast(list[WorkerResult], poll_ready(max_items=max_items))
         if not results:
             return 0
+        received_at_ms = _now_ms()
         with self._lock:
             for result in results:
-                self._apply_worker_result(result)
+                self._apply_worker_result(result, received_at_ms=received_at_ms)
         return len(results)
 
     def _ready_drain_loop(self) -> None:
@@ -628,10 +665,18 @@ class SidecarManager:
             if drained == 0:
                 time.sleep(0.0005)
 
-    def _apply_worker_result(self, result: WorkerResult) -> None:
+    def _apply_worker_result(
+        self,
+        result: WorkerResult,
+        *,
+        received_at_ms: float | None = None,
+    ) -> None:
         entry = self._entries.get(result.cache_key)
         if entry is None:
             return
+        result_timings = dict(result.timings_ms) if result.timings_ms is not None else {}
+        if received_at_ms is not None:
+            result_timings[f"manager_{result.event_type}_received_at_ms"] = received_at_ms
         if result.event_type == "started":
             if result.epoch == entry.epoch and entry.state is SidecarState.QUEUED:
                 entry.state = SidecarState.SIDECAR_RUNNING
@@ -661,9 +706,32 @@ class SidecarManager:
                     allow_redirects=entry.descriptor.allow_redirects,
                     payload_hint=entry.descriptor.payload_hint,
                 )
-            if result.timings_ms is not None:
-                entry.timings_ms = dict(result.timings_ms)
+            if result_timings:
+                entry.timings_ms = result_timings
             entry.updated_at_ms = result.at_ms
+            return
+
+        if result.event_type == "ready_put_done":
+            if result.epoch != entry.epoch:
+                return
+            existing_timings = (
+                dict(entry.timings_ms) if entry.timings_ms is not None else {}
+            )
+            merged_timings = {**existing_timings, **result_timings}
+            apply_start_at_ms = _float_timing(
+                merged_timings,
+                "manager_ready_apply_start_at_ms",
+            )
+            put_done_at_ms = _float_timing(
+                merged_timings,
+                "worker_ready_put_done_at_ms",
+            )
+            if apply_start_at_ms is not None and put_done_at_ms is not None:
+                merged_timings["manager_ready_put_done_to_apply_ms"] = max(
+                    0.0,
+                    apply_start_at_ms - put_done_at_ms,
+                )
+            entry.timings_ms = merged_timings
             return
 
         if self._worker_loads.get(result.worker_id, 0) > 0:
@@ -676,21 +744,60 @@ class SidecarManager:
             return
 
         if result.event_type == "ready" and result.descriptor is not None and result.payload is not None:
+            existing_timings = (
+                dict(entry.timings_ms) if entry.timings_ms is not None else {}
+            )
+            ready_timings = {**existing_timings, **result_timings}
+            apply_start_at_ms = _now_ms()
+            ready_timings["manager_ready_apply_start_at_ms"] = apply_start_at_ms
+            if received_at_ms is not None:
+                ready_timings["manager_ready_receive_to_apply_ms"] = max(
+                    0.0,
+                    apply_start_at_ms - received_at_ms,
+                )
+            put_start_at_ms = _float_timing(
+                ready_timings,
+                "worker_ready_put_start_at_ms",
+            )
+            if put_start_at_ms is not None:
+                ready_timings["manager_ready_queue_to_apply_ms"] = max(
+                    0.0,
+                    apply_start_at_ms - put_start_at_ms,
+                )
+            put_done_at_ms = _float_timing(
+                ready_timings,
+                "worker_ready_put_done_at_ms",
+            )
+            if put_done_at_ms is not None:
+                ready_timings["manager_ready_put_done_to_apply_ms"] = max(
+                    0.0,
+                    apply_start_at_ms - put_done_at_ms,
+                )
+            cache_put_started_ms = _now_ms()
             self._cache_pool.put(result.cache_key, result.descriptor, result.payload)
+            cache_put_finished_ms = _now_ms()
+            ready_timings["manager_cache_put_ms"] = max(
+                0.0,
+                cache_put_finished_ms - cache_put_started_ms,
+            )
+            ready_timings["manager_ready_apply_total_ms"] = max(
+                0.0,
+                cache_put_finished_ms - apply_start_at_ms,
+            )
             entry.state = SidecarState.READY
             entry.artifact_descriptor = result.descriptor
             entry.fallback_local_payload = None
             entry.fallback_local_timings_ms = None
             if result.schedule_item is not None:
                 entry.schedule_item = result.schedule_item
-            entry.timings_ms = dict(result.timings_ms) if result.timings_ms is not None else None
+            entry.timings_ms = ready_timings
             entry.error_message = None
             entry.updated_at_ms = result.at_ms
             return
 
         if result.event_type == "failed":
             entry.state = SidecarState.FAILED
-            entry.timings_ms = dict(result.timings_ms) if result.timings_ms is not None else None
+            entry.timings_ms = result_timings if result_timings else None
             entry.error_message = result.error_message
             entry.updated_at_ms = result.at_ms
 
