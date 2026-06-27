@@ -297,9 +297,9 @@ def _vit_dp_direct_cache_ready_wait_ms() -> float:
 def _defer_vit_dp_direct_cache_on_fallback_enabled() -> bool:
     value = os.getenv(
         "MM_SIDECAR_DEFER_VIT_DP_DIRECT_CACHE_ON_FALLBACK",
-        "1",
+        "0",
     ).strip().lower()
-    return value not in {"0", "false", "no", "off"}
+    return value in {"1", "true", "yes", "on"}
 
 
 def _mode_is_data(value: Any) -> bool:

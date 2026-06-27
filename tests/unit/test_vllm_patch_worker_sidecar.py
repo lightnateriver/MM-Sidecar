@@ -1716,6 +1716,7 @@ class VllmPatchWorkerSidecarTests(unittest.TestCase):
             {
                 "MM_SIDECAR_ENABLE_VIT_DP_DIRECT_ENCODE": "0",
                 "MM_SIDECAR_ENABLE_VIT_DP_SHARD_FETCH": "1",
+                "MM_SIDECAR_DEFER_VIT_DP_DIRECT_CACHE_ON_FALLBACK": "1",
             },
         ), mock.patch(
             "mm_sidecar.integrations.vllm_patch.worker_sidecar._uses_vit_data_parallel",
