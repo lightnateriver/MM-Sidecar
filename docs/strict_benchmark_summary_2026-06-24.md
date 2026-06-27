@@ -701,3 +701,83 @@ plan that avoids Python object serialization for pixel_values.
 3. Investigate why local_path/base64 still trigger local fallback in some measured worker paths.
 4. Keep the single-image bypass policy enabled by default and expand it only if real traffic shows 2-image cheap cases are also slower.
 5. Continue output-contract hardening for 20-image strict runs; loose visual semantics are already clean.
+
+## TP2 Batch `fetch_ready` Experiment
+
+A batch artifact fetch path was implemented and tested as a low-intrusion
+alternative to shared-memory tensor payload transport.
+
+Implementation commits:
+
+```text
+377144b perf: batch sidecar ready artifact fetch
+6b81077 fix: keep batch ready fetch opt-in
+```
+
+The manager and client now expose `fetch_ready_batch()`, and the coordinator can
+use it when explicitly enabled. The default remains the prior per-artifact
+`fetch_ready()` path because the strict benchmark showed batch payload transfer
+is not a safe default on this backend.
+
+Runtime switch:
+
+```bash
+MM_SIDECAR_ENABLE_BATCH_FETCH_READY=1
+```
+
+Remote artifacts:
+
+```text
+/root/mm-sidecar-e2e/tp2_sidecar_batch_fetch_probe_seed2709_20260627.json
+/root/mm-sidecar-e2e/tp2_sidecar_batch_fetch_strict_seed2710_20260627.json
+/root/mm-sidecar-e2e/run_logs_20260627_150841_direct_cache/api.log
+```
+
+Strict protocol:
+
+```text
+TP2 + --mm-encoder-tp-mode data + shard-fetch/direct-cache
+MM processor workers: 32
+warmup 3 + measured 5
+transports: local_path, http, base64
+image counts: 1, 13, 20
+unique generated images for every case/run
+```
+
+Performance comparison:
+
+| transport | imgs | base TTFT | old sidecar TTFT | batch-fetch TTFT | vs old | vs base | base E2E | old E2E | batch E2E | semantic |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| base64 | 1 | 78.50 | 80.89 | 82.03 | +1.14 | +3.53 | 103.26 | 106.19 | 107.88 | 5/5 |
+| base64 | 13 | 232.68 | 200.97 | 216.22 | +15.26 | -16.46 | 255.51 | 224.96 | 240.74 | 5/5 |
+| base64 | 20 | 422.57 | 305.19 | 299.36 | -5.82 | -123.20 | 446.87 | 360.66 | 420.12 | 3/5 |
+| http | 1 | 78.51 | 84.14 | 85.04 | +0.91 | +6.54 | 103.17 | 109.64 | 110.76 | 5/5 |
+| http | 13 | 1272.30 | 1187.50 | 1232.42 | +44.92 | -39.88 | 1294.82 | 1211.15 | 1256.25 | 5/5 |
+| http | 20 | 1486.50 | 1381.13 | 1491.41 | +110.28 | +4.92 | 1510.61 | 1405.97 | 1517.04 | 5/5 |
+| local_path | 1 | 80.15 | 83.86 | 85.53 | +1.68 | +5.38 | 105.07 | 109.23 | 111.16 | 5/5 |
+| local_path | 13 | 225.38 | 214.11 | 236.95 | +22.84 | +11.57 | 249.05 | 238.37 | 261.32 | 5/5 |
+| local_path | 20 | 411.80 | 296.21 | 335.85 | +39.64 | -75.94 | 436.35 | 321.27 | 361.08 | 5/5 |
+
+Worker-side fetch profile from the batch run:
+
+| transport | imgs | worker fetch avg ms | fetch_ms avg | client RPC avg | local fallback avg | payload MB avg | batch RPC calls/run-rank | batch items/run-rank |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| base64 | 13 | 71.37 | 27.42 | 27.39 | 28.73 | 21.9 | 1.00 | 2.80 |
+| base64 | 20 | 32.20 | 20.38 | 20.34 | 15.76 | 16.9 | 1.00 | 4.00 |
+| http | 13 | 64.34 | 63.54 | 63.50 | 0.00 | 21.9 | 1.00 | 6.50 |
+| http | 20 | 43.47 | 42.72 | 42.68 | 0.00 | 16.9 | 1.00 | 5.00 |
+| local_path | 13 | 87.23 | 29.48 | 29.45 | 32.71 | 21.9 | 1.00 | 2.70 |
+| local_path | 20 | 49.00 | 24.16 | 24.12 | 25.60 | 16.9 | 1.00 | 3.50 |
+
+Conclusion:
+
+```text
+Batch fetch successfully reduces RPC call count to one call per run/rank, but it
+does not reduce the dominant payload-transfer cost. In HTTP 13/20 it is clearly
+slower, likely because one large multiprocessing response increases pickle/send
+critical-path blocking and removes useful per-artifact scheduling granularity.
+
+Keep the code as an opt-in diagnostic/experimental path, but keep it disabled by
+default. The next optimization should target payload representation or reducing
+local fallback frequency, not merely reducing the number of fetch_ready RPCs.
+```
