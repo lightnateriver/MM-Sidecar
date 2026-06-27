@@ -27,6 +27,8 @@ from mm_sidecar.integrations.vllm_patch.worker_sidecar import (
     _load_balance_assignment,
     _manual_encode_and_gather_local_items,
     _run_dp_sharded_mrope_vision_model_with_sidecar,
+    _source_plan_entries_debug,
+    _source_plan_numeric_diagnostics,
     _try_execute_vit_dp_sidecar_direct_encode,
     _resolve_vit_dp_local_indices,
     bind_request_mm_sidecar,
@@ -40,7 +42,9 @@ from mm_sidecar.sidecar import (
     InlineProcessorWorkerPool,
     SidecarManager,
     SidecarState,
+    SourcePlan,
     SourcePlanDecision,
+    SourcePlanEntry,
 )
 from unittest import mock
 
@@ -1804,6 +1808,62 @@ class VllmPatchWorkerSidecarTests(unittest.TestCase):
         self.assertIsNone(result)
         self.assertEqual(runner.encoder_cache, {})
 
+    def test_source_plan_debug_diagnostics_counts_reasons(self) -> None:
+        role = TpWorkerRole(
+            local_rank=0,
+            world_size=2,
+            coordinator_rank=0,
+            is_coordinator=True,
+        )
+        source_plan = SourcePlan(
+            request_id="req-plan-debug",
+            entries=(
+                SourcePlanEntry(
+                    request_media_index=0,
+                    decision=SourcePlanDecision.USE_SIDECAR,
+                    handle=SimpleNamespace(request_media_index=0),
+                    state=SidecarState.READY,
+                    reason="ready_before_fallback",
+                ),
+                SourcePlanEntry(
+                    request_media_index=1,
+                    decision=SourcePlanDecision.FALLBACK,
+                    producer_rank=0,
+                    handle=SimpleNamespace(request_media_index=1),
+                    state=SidecarState.SIDECAR_RUNNING,
+                    reason="preview_requires_fallback",
+                ),
+                SourcePlanEntry(
+                    request_media_index=2,
+                    decision=SourcePlanDecision.FALLBACK,
+                    producer_rank=1,
+                    handle=SimpleNamespace(request_media_index=2),
+                    state=SidecarState.FALLBACK_CLAIMED,
+                    reason="fallback_claim_already_owned",
+                ),
+            ),
+            near_ready_wait_ms=3.5,
+            used_fail_open=False,
+        )
+
+        diagnostics = _source_plan_numeric_diagnostics(source_plan, role=role)
+
+        self.assertEqual(diagnostics["source_plan_entry_count"], 3.0)
+        self.assertEqual(diagnostics["source_plan_use_sidecar_count"], 1.0)
+        self.assertEqual(diagnostics["source_plan_fallback_count"], 2.0)
+        self.assertEqual(diagnostics["source_plan_local_fallback_count"], 1.0)
+        self.assertEqual(diagnostics["source_plan_remote_fallback_count"], 1.0)
+        self.assertEqual(diagnostics["source_plan_state_ready"], 1.0)
+        self.assertEqual(diagnostics["source_plan_state_sidecar_running"], 1.0)
+        self.assertEqual(
+            diagnostics["source_plan_reason_preview_requires_fallback"],
+            1.0,
+        )
+        self.assertIn(
+            "1:FALLBACK:SIDECAR_RUNNING:preview_requires_fallback:rank=0",
+            _source_plan_entries_debug(source_plan, only_indexes={1}),
+        )
+
     def test_manual_encode_and_gather_local_items_reconstructs_original_order(self) -> None:
         class _FakeTensor:
             def __init__(self, values):
@@ -1973,6 +2033,18 @@ class VllmPatchWorkerSidecarTests(unittest.TestCase):
         self.assertEqual(seen_local_indices, [(1,)])
         self.assertEqual(vision_model.seen_pixel_shape, (16, 3))
         self.assertEqual(vision_model.seen_grid, [[1, 4, 4]])
+        self.assertEqual(
+            context.model_runner.mm_sidecar_last_vit_dp_shard_fetch[
+                "local_request_media_indexes"
+            ],
+            (1,),
+        )
+        self.assertEqual(
+            context.model_runner.mm_sidecar_last_vit_dp_shard_fetch["timings_ms"][
+                "payload_bytes"
+            ],
+            192.0,
+        )
         self.assertEqual([float(item[0].item()) for item in outputs], [10.0, 20.0, 30.0])
 
 

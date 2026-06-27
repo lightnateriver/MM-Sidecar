@@ -813,6 +813,112 @@ def _merge_fetch_diagnostics(
     return merged
 
 
+def _debug_value_name(value: Any) -> str:
+    raw = getattr(value, "value", value)
+    if raw is None:
+        return "none"
+    return str(raw)
+
+
+def _diagnostic_suffix(value: Any) -> str:
+    raw = _debug_value_name(value).lower()
+    chars = [
+        char if ("a" <= char <= "z" or "0" <= char <= "9") else "_"
+        for char in raw
+    ]
+    suffix = "".join(chars).strip("_")
+    return suffix or "unknown"
+
+
+def _source_plan_numeric_diagnostics(
+    source_plan: Any,
+    *,
+    role: TpWorkerRole,
+) -> dict[str, float]:
+    entries = tuple(getattr(source_plan, "entries", ()) or ())
+    diagnostics: dict[str, float] = {
+        "source_plan_entry_count": float(len(entries)),
+        "source_plan_use_sidecar_count": 0.0,
+        "source_plan_fallback_count": 0.0,
+        "source_plan_local_fallback_count": 0.0,
+        "source_plan_remote_fallback_count": 0.0,
+        "source_plan_reported_wait_ms": float(
+            getattr(source_plan, "near_ready_wait_ms", 0.0) or 0.0
+        ),
+        "source_plan_used_fail_open": (
+            1.0 if bool(getattr(source_plan, "used_fail_open", False)) else 0.0
+        ),
+    }
+    for entry in entries:
+        decision = getattr(entry, "decision", None)
+        if decision == SourcePlanDecision.USE_SIDECAR:
+            diagnostics["source_plan_use_sidecar_count"] += 1.0
+        elif decision == SourcePlanDecision.FALLBACK:
+            diagnostics["source_plan_fallback_count"] += 1.0
+            producer_rank = getattr(entry, "producer_rank", None)
+            if producer_rank is not None and int(producer_rank) != role.local_rank:
+                diagnostics["source_plan_remote_fallback_count"] += 1.0
+            else:
+                diagnostics["source_plan_local_fallback_count"] += 1.0
+
+        state_key = "source_plan_state_" + _diagnostic_suffix(
+            getattr(entry, "state", None)
+        )
+        diagnostics[state_key] = diagnostics.get(state_key, 0.0) + 1.0
+        reason_key = "source_plan_reason_" + _diagnostic_suffix(
+            getattr(entry, "reason", None)
+        )
+        diagnostics[reason_key] = diagnostics.get(reason_key, 0.0) + 1.0
+    return diagnostics
+
+
+def _source_plan_entries_debug(
+    source_plan: Any,
+    *,
+    only_indexes: set[int] | None = None,
+) -> str:
+    entries = []
+    for entry in getattr(source_plan, "entries", ()) or ():
+        try:
+            request_media_index = int(getattr(entry, "request_media_index"))
+        except (TypeError, ValueError):
+            continue
+        if only_indexes is not None and request_media_index not in only_indexes:
+            continue
+        producer_rank = getattr(entry, "producer_rank", None)
+        rank_text = "-" if producer_rank is None else str(producer_rank)
+        entries.append(
+            f"{request_media_index}:"
+            f"{_debug_value_name(getattr(entry, 'decision', None))}:"
+            f"{_debug_value_name(getattr(entry, 'state', None))}:"
+            f"{getattr(entry, 'reason', None) or 'none'}:"
+            f"rank={rank_text}"
+        )
+    return ",".join(entries)
+
+
+def _descriptor_indexes(
+    descriptors: list[Any] | tuple[Any, ...],
+) -> tuple[int, ...]:
+    indexes: list[int] = []
+    for descriptor in descriptors:
+        try:
+            indexes.append(int(descriptor.request_media_index))
+        except (AttributeError, TypeError, ValueError):
+            continue
+    return tuple(indexes)
+
+
+def _artifact_indexes(artifacts: list[Any] | tuple[Any, ...]) -> tuple[int, ...]:
+    indexes: list[int] = []
+    for artifact in artifacts:
+        try:
+            indexes.append(int(artifact.handle.request_media_index))
+        except (AttributeError, TypeError, ValueError):
+            continue
+    return tuple(indexes)
+
+
 def _all_tp_ranks_ready_for_direct_encode(
     ready: bool,
     *,
@@ -1800,11 +1906,28 @@ def _fetch_vit_dp_shard_pixel_values(
     local_items = tuple(items[index] for index in image_idxs_local)
     descriptors = [item.descriptor for item in local_items]
     handles = [item.handle for item in local_items]
+    local_media_indexes = tuple(int(item.request_media_index) for item in local_items)
     client = get_worker_sidecar_client(required=False)
     diagnostics: dict[str, float] = {}
     artifacts: list[Any] = []
 
     if client is None:
+        diagnostics.update(
+            {
+                "source_plan_entry_count": float(len(local_items)),
+                "source_plan_fallback_count": float(len(local_items)),
+                "source_plan_local_fallback_count": float(len(local_items)),
+                "source_plan_manager_unavailable_count": float(len(local_items)),
+            }
+        )
+        if _worker_fetch_profile_enabled():
+            _emit_worker_debug(
+                "vit_dp_shard_fetch_plan "
+                f"rank={role.local_rank}/{role.world_size} "
+                "manager=0 "
+                f"local_media={list(local_media_indexes)} "
+                "reason=manager_unavailable_fail_open"
+            )
         fallback_start = time.perf_counter()
         artifacts.extend(_run_local_fallback_artifacts(descriptors))
         diagnostics["local_fallback_ms"] = (
@@ -1833,6 +1956,14 @@ def _fetch_vit_dp_shard_pixel_values(
         diagnostics["source_plan_ms"] = (
             time.perf_counter() - source_plan_start
         ) * 1000.0
+        diagnostics.update(_source_plan_numeric_diagnostics(source_plan, role=role))
+        if _worker_fetch_profile_enabled():
+            _emit_worker_debug(
+                "vit_dp_shard_fetch_plan "
+                f"rank={role.local_rank}/{role.world_size} "
+                f"manager=1 local_media={list(local_media_indexes)} "
+                f"entries={_source_plan_entries_debug(source_plan)}"
+            )
         fetch_start = time.perf_counter()
         fetch_batch = coordinator.fetch_according_to_plan(
             descriptors=descriptors,
@@ -1841,7 +1972,19 @@ def _fetch_vit_dp_shard_pixel_values(
         )
         diagnostics["fetch_ms"] = (time.perf_counter() - fetch_start) * 1000.0
         artifacts.extend(fetch_batch.sidecar_artifacts)
+        sidecar_indexes = _artifact_indexes(fetch_batch.sidecar_artifacts)
+        fallback_indexes = _descriptor_indexes(fetch_batch.fallback_descriptors)
+        diagnostics["fetch_sidecar_count"] = float(len(sidecar_indexes))
+        diagnostics["fetch_local_fallback_count"] = float(len(fallback_indexes))
         if fetch_batch.fallback_descriptors:
+            if _worker_fetch_profile_enabled():
+                _emit_worker_debug(
+                    "vit_dp_shard_fetch_fallback "
+                    f"rank={role.local_rank}/{role.world_size} "
+                    f"fallback_media={list(fallback_indexes)} "
+                    "entries="
+                    f"{_source_plan_entries_debug(source_plan, only_indexes=set(fallback_indexes))}"
+                )
             fallback_start = time.perf_counter()
             artifacts.extend(_run_local_fallback_artifacts(fetch_batch.fallback_descriptors))
             diagnostics["local_fallback_ms"] = (
@@ -2056,6 +2199,10 @@ def _run_dp_sharded_mrope_vision_model_with_sidecar(
             "rank": role.local_rank,
             "world_size": role.world_size,
             "local_indices": tuple(int(index) for index in image_idxs_local),
+            "local_request_media_indexes": tuple(
+                int(context_items[index].request_media_index)
+                for index in image_idxs_local
+            ),
             "total_images": len(grid_thw_list),
             "payload_bytes": diagnostics.get("payload_bytes", 0.0),
             "timings_ms": dict(diagnostics),
