@@ -30,6 +30,7 @@ from mm_sidecar.integrations.vllm_patch.worker_sidecar import (
     _source_plan_entries_debug,
     _source_plan_numeric_diagnostics,
     _try_execute_vit_dp_sidecar_direct_encode,
+    _vit_dp_direct_cache_ready_wait_ms,
     _resolve_vit_dp_local_indices,
     bind_request_mm_sidecar,
     build_worker_source_plan,
@@ -1807,6 +1808,27 @@ class VllmPatchWorkerSidecarTests(unittest.TestCase):
 
         self.assertIsNone(result)
         self.assertEqual(runner.encoder_cache, {})
+
+    def test_vit_dp_direct_cache_ready_wait_uses_shard_fetch_wait(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {
+                "MM_SIDECAR_ENABLE_VIT_DP_SHARD_FETCH": "1",
+                "MM_SIDECAR_ENABLE_VIT_DP_DIRECT_ENCODE": "0",
+                "MM_SIDECAR_NATIVE_VIT_DP_READY_WAIT_MS": "37",
+            },
+        ):
+            self.assertEqual(_vit_dp_direct_cache_ready_wait_ms(), 37.0)
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                "MM_SIDECAR_ENABLE_VIT_DP_SHARD_FETCH": "1",
+                "MM_SIDECAR_ENABLE_VIT_DP_DIRECT_ENCODE": "1",
+                "MM_SIDECAR_NATIVE_VIT_DP_READY_WAIT_MS": "37",
+            },
+        ):
+            self.assertEqual(_vit_dp_direct_cache_ready_wait_ms(), 2.0)
 
     def test_source_plan_debug_diagnostics_counts_reasons(self) -> None:
         role = TpWorkerRole(

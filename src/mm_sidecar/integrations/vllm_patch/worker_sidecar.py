@@ -278,6 +278,12 @@ def _native_vit_dp_ready_wait_ms() -> float:
         return 50.0
 
 
+def _vit_dp_direct_cache_ready_wait_ms() -> float:
+    if _vit_dp_shard_fetch_enabled() and not _vit_dp_direct_encode_enabled():
+        return _native_vit_dp_ready_wait_ms()
+    return 2.0
+
+
 def _mode_is_data(value: Any) -> bool:
     if value is None:
         return False
@@ -1718,7 +1724,7 @@ def _build_vit_dp_execution_plan_for_request(
                 producer_rank=role.local_rank,
             ),
             producer_rank=role.local_rank,
-            near_ready_wait_ms=2.0,
+            near_ready_wait_ms=_vit_dp_direct_cache_ready_wait_ms(),
             poll_interval_ms=1.0,
             fallback_wait_ms=_remote_fallback_wait_ms(),
             observe_plan_wait_ms=_peer_plan_wait_ms(),
@@ -1784,6 +1790,16 @@ def _sidecar_or_fallback_items_for_plan(
     diagnostics: dict[str, float] = {}
     artifacts: list[Any] = []
     if client is None or not plan.binding.enabled:
+        diagnostics.update(
+            {
+                "source_plan_entry_count": float(len(local_descriptors)),
+                "source_plan_fallback_count": float(len(local_descriptors)),
+                "source_plan_local_fallback_count": float(len(local_descriptors)),
+                "source_plan_manager_unavailable_count": float(
+                    len(local_descriptors)
+                ),
+            }
+        )
         fallback_start = time.perf_counter()
         artifacts.extend(_run_local_fallback_artifacts(local_descriptors))
         diagnostics["local_fallback_ms"] = (
@@ -1814,7 +1830,7 @@ def _sidecar_or_fallback_items_for_plan(
             producer_rank=role.local_rank,
         ),
         producer_rank=role.local_rank,
-        near_ready_wait_ms=2.0,
+        near_ready_wait_ms=_vit_dp_direct_cache_ready_wait_ms(),
         poll_interval_ms=1.0,
         fallback_wait_ms=_remote_fallback_wait_ms(),
         observe_plan_wait_ms=_peer_plan_wait_ms(),
@@ -1826,8 +1842,32 @@ def _sidecar_or_fallback_items_for_plan(
         source_plan=plan.source_plan,
     )
     diagnostics["fetch_ms"] = (time.perf_counter() - fetch_start) * 1000.0
+    diagnostics.update(
+        _source_plan_numeric_diagnostics(fetch_batch.source_plan, role=role)
+    )
     artifacts.extend(fetch_batch.sidecar_artifacts)
+    sidecar_indexes = _artifact_indexes(fetch_batch.sidecar_artifacts)
+    fallback_indexes = _descriptor_indexes(fetch_batch.fallback_descriptors)
+    diagnostics["fetch_sidecar_count"] = float(len(sidecar_indexes))
+    diagnostics["fetch_local_fallback_count"] = float(len(fallback_indexes))
+    if _worker_fetch_profile_enabled():
+        _emit_worker_debug(
+            "direct_cache_source_plan "
+            f"req={plan.binding.request_id} "
+            f"rank={role.local_rank}/{role.world_size} "
+            f"local_media={list(local_request_media_ids)} "
+            f"entries={_source_plan_entries_debug(fetch_batch.source_plan)}"
+        )
     if fetch_batch.fallback_descriptors:
+        if _worker_fetch_profile_enabled():
+            _emit_worker_debug(
+                "direct_cache_fallback "
+                f"req={plan.binding.request_id} "
+                f"rank={role.local_rank}/{role.world_size} "
+                f"fallback_media={list(fallback_indexes)} "
+                "entries="
+                f"{_source_plan_entries_debug(fetch_batch.source_plan, only_indexes=set(fallback_indexes))}"
+            )
         fallback_start = time.perf_counter()
         local_fallback_artifacts = _run_local_fallback_artifacts(
             fetch_batch.fallback_descriptors,
