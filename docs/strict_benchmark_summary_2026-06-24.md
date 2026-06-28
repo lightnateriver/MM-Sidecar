@@ -916,6 +916,11 @@ Performance comparison:
 | local_file_raw | http | 5/5 | 4/5 | 1482.29/1646.35 | 1580.75/1894.45 | 480/480 |
 | local_file_raw | base64 | 5/5 | 4/5 | 301.55/321.80 | 392.31/635.83 | 480/480 |
 
+Segmented diagnostics below use `sidecar_prepare.worker_timings_ms.avg` for the
+worker-to-manager and worker preprocess columns, so those columns are
+prepare-stage per-image averages. Worker-side fetch-profile aggregates are kept
+in the JSON artifacts for request/rank-level analysis.
+
 Segmented diagnostics:
 
 | mode | transport | ready | w2m recv | w2m cache | file write | worker pre/total | client rpc | fetch | worker fetch | sidecar/fallback |
