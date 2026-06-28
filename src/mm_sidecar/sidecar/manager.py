@@ -7,6 +7,7 @@ from typing import Any, cast
 
 from mm_sidecar.contracts import ArtifactDescriptor, ImageScheduleItem
 
+from .artifact_store import cleanup_local_file_payload
 from .cache import CpuMemoryCachePool
 from .config import SidecarManagerConfig
 from .processor import (
@@ -139,6 +140,10 @@ class SidecarManager:
         close_cache = getattr(self._cache_pool, "close", None)
         if callable(close_cache):
             close_cache()
+        with self._lock:
+            for entry in self._entries.values():
+                self._clear_fallback_local_payload(entry)
+            self._entries.clear()
 
     def prepare(
         self,
@@ -472,8 +477,7 @@ class SidecarManager:
                     entry.state = SidecarState.FALLBACK_CLAIMED
                     entry.claimed_by = claimer_id
                     entry.artifact_descriptor = None
-                    entry.fallback_local_payload = None
-                    entry.fallback_local_timings_ms = None
+                    self._clear_fallback_local_payload(entry)
                     entry.updated_at_ms = _now_ms()
                     entry.error_message = None
                     granted = True
@@ -543,6 +547,7 @@ class SidecarManager:
                 )
             entry.state = SidecarState.FALLBACK_LOCAL_DONE
             entry.artifact_descriptor = descriptor
+            self._clear_fallback_local_payload(entry)
             entry.fallback_local_payload = payload
             entry.fallback_local_timings_ms = (
                 dict(timings_ms) if timings_ms is not None else None
@@ -608,6 +613,8 @@ class SidecarManager:
         cached = self._cache_pool.get(cache_key)
         if cached is not None:
             artifact_descriptor, _ = cached
+            if entry is not None:
+                self._clear_fallback_local_payload(entry)
             entry = _ManagedEntry(
                 descriptor=descriptor,
                 epoch=entry.epoch + 1 if entry is not None else 1,
@@ -618,6 +625,8 @@ class SidecarManager:
             )
             self._entries[cache_key] = entry
             return entry
+        if entry is not None:
+            self._clear_fallback_local_payload(entry)
         worker_id = self._choose_worker_id()
         epoch = entry.epoch + 1 if entry is not None else 1
         entry = _ManagedEntry(
@@ -802,8 +811,7 @@ class SidecarManager:
             )
             entry.state = SidecarState.READY
             entry.artifact_descriptor = result.descriptor
-            entry.fallback_local_payload = None
-            entry.fallback_local_timings_ms = None
+            self._clear_fallback_local_payload(entry)
             if result.schedule_item is not None:
                 entry.schedule_item = result.schedule_item
             entry.timings_ms = ready_timings
@@ -816,6 +824,12 @@ class SidecarManager:
             entry.timings_ms = result_timings if result_timings else None
             entry.error_message = result.error_message
             entry.updated_at_ms = result.at_ms
+
+    def _clear_fallback_local_payload(self, entry: _ManagedEntry) -> None:
+        if entry.fallback_local_payload is not None:
+            cleanup_local_file_payload(entry.fallback_local_payload)
+            entry.fallback_local_payload = None
+        entry.fallback_local_timings_ms = None
 
     def _refresh_ready_entry(self, entry: _ManagedEntry) -> None:
         if entry.state is not SidecarState.READY:

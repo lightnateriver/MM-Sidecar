@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from io import BytesIO
 from pathlib import Path
+from unittest import mock
 
 from PIL import Image
 
@@ -15,6 +16,7 @@ from mm_sidecar.contracts import (
     NormalizedImage,
     ProcessorConfig,
     ProcessorSignature,
+    StorageKind,
 )
 from mm_sidecar.contracts.identity import build_local_source_key
 from mm_sidecar.contracts.media_source import MediaSourceRef
@@ -593,6 +595,97 @@ class SidecarCoordinatorTests(unittest.TestCase):
                 batch.sidecar_artifacts[0].payload.image_grid_thw,
                 local_artifact.payload.image_grid_thw,
             )
+            manager.close()
+
+    def test_fallback_local_file_payload_is_cleaned_on_manager_close(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            image_path = Path(tmpdir) / "fallback-local-file-close.jpg"
+            image_path.write_bytes(_make_jpeg_bytes())
+
+            manager = SidecarManager(worker_pool=_ManualWorkerPool())
+            descriptor = _make_descriptor(image_path, "req-fallback-local-file-close", 0)
+            handles = manager.prepare([descriptor])
+            claim_id = build_ranked_claimer_id(
+                request_id="req-fallback-local-file-close",
+                producer_rank=0,
+            )
+            claims = manager.try_fallback_claim(handles, claim_id)
+            self.assertTrue(claims[0].granted)
+
+            with mock.patch.dict(
+                "os.environ",
+                {
+                    "MM_SIDECAR_PAYLOAD_STORAGE": "local_file",
+                    "MM_SIDECAR_PAYLOAD_DIR": str(Path(tmpdir) / "payloads"),
+                },
+            ):
+                local_artifact = run_descriptor_locally(
+                    descriptor,
+                    epoch=claims[0].handle.epoch,
+                    worker_id=0,
+                )
+
+            self.assertEqual(local_artifact.payload.storage_kind, StorageKind.LOCAL_FILE)
+            ref_path = Path(local_artifact.payload.pixel_values.path)
+            self.assertTrue(ref_path.exists())
+
+            snapshot = manager.publish_fallback_local_result(
+                claims[0].handle,
+                claim_id,
+                local_artifact.descriptor,
+                local_artifact.payload,
+                local_artifact.timings_ms,
+            )
+            self.assertEqual(snapshot.state, SidecarState.FALLBACK_LOCAL_DONE)
+
+            manager.close()
+            self.assertFalse(ref_path.exists())
+
+    def test_reprepare_cleans_previous_fallback_local_file_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            image_path = Path(tmpdir) / "fallback-local-file-reprepare.jpg"
+            image_path.write_bytes(_make_jpeg_bytes())
+
+            manager = SidecarManager(worker_pool=_ManualWorkerPool())
+            descriptor = _make_descriptor(image_path, "req-fallback-local-file-old", 0)
+            handles = manager.prepare([descriptor])
+            claim_id = build_ranked_claimer_id(
+                request_id="req-fallback-local-file-old",
+                producer_rank=0,
+            )
+            claims = manager.try_fallback_claim(handles, claim_id)
+            self.assertTrue(claims[0].granted)
+
+            with mock.patch.dict(
+                "os.environ",
+                {
+                    "MM_SIDECAR_PAYLOAD_STORAGE": "local_file",
+                    "MM_SIDECAR_PAYLOAD_DIR": str(Path(tmpdir) / "payloads"),
+                },
+            ):
+                local_artifact = run_descriptor_locally(
+                    descriptor,
+                    epoch=claims[0].handle.epoch,
+                    worker_id=0,
+                )
+
+            ref_path = Path(local_artifact.payload.pixel_values.path)
+            self.assertTrue(ref_path.exists())
+            snapshot = manager.publish_fallback_local_result(
+                claims[0].handle,
+                claim_id,
+                local_artifact.descriptor,
+                local_artifact.payload,
+                local_artifact.timings_ms,
+            )
+            self.assertEqual(snapshot.state, SidecarState.FALLBACK_LOCAL_DONE)
+
+            next_descriptor = replace(
+                descriptor,
+                request_id="req-fallback-local-file-new",
+            )
+            manager.prepare([next_descriptor])
+            self.assertFalse(ref_path.exists())
             manager.close()
 
     def test_stale_handle_from_previous_request_cannot_claim_or_fetch(self) -> None:
