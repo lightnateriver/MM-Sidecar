@@ -859,3 +859,87 @@ small budgets such as 10/20/40 ms, or waiting only when historical sidecar
 completion is usually cheaper than local fallback for that transport/image
 count. Do not enable fixed 100 ms by default.
 ```
+
+## TP2 Raw Local-File Payload Experiment
+
+To test whether `.npy` tensor files were adding avoidable payload overhead, a
+raw local-file tensor payload format was added as an opt-in mode.
+
+Implementation commit:
+
+```text
+556e155 perf: add raw local file payload format
+```
+
+Runtime switch:
+
+```bash
+MM_SIDECAR_PAYLOAD_STORAGE=local_file
+MM_SIDECAR_PAYLOAD_FILE_FORMAT=raw
+```
+
+Default behavior remains `.npy`; raw is opt-in only.
+
+Remote artifacts:
+
+```text
+/root/mm-sidecar-e2e/strict_item3_raw_seed202606281300_20260628_124545/cpu_memory.json
+/root/mm-sidecar-e2e/strict_item3_raw_seed202606281300_20260628_124545/local_file_npy.json
+/root/mm-sidecar-e2e/strict_item3_raw_seed202606281300_20260628_124545/local_file_raw.json
+```
+
+Strict protocol:
+
+```text
+TP2 + --mm-encoder-tp-mode data + --enforce-eager
+MM processor workers: 32
+worker/control CPU affinity enabled
+shard-fetch enabled, direct encode disabled
+warmup 3 + measured 5
+transports: local_path, http, base64
+image counts: 20
+same seed across cpu_memory/local_file_npy/local_file_raw
+all image references unique: 480/480 per run file
+```
+
+Performance comparison:
+
+| mode | transport | success | semantic | TTFT avg/max ms | E2E avg/max ms | unique images |
+|---|---|---:|---:|---:|---:|---:|
+| cpu_memory | local_path | 5/5 | 4/5 | 454.24/486.29 | 523.04/668.84 | 480/480 |
+| cpu_memory | http | 5/5 | 4/5 | 1620.33/1693.41 | 1705.01/1986.05 | 480/480 |
+| cpu_memory | base64 | 5/5 | 4/5 | 465.88/472.50 | 553.53/786.27 | 480/480 |
+| local_file_npy | local_path | 5/5 | 4/5 | 302.51/319.44 | 397.25/656.18 | 480/480 |
+| local_file_npy | http | 5/5 | 4/5 | 1534.31/1612.44 | 1614.57/1807.12 | 480/480 |
+| local_file_npy | base64 | 5/5 | 4/5 | 272.89/305.25 | 339.74/505.18 | 480/480 |
+| local_file_raw | local_path | 5/5 | 4/5 | 321.76/331.14 | 421.03/661.95 | 480/480 |
+| local_file_raw | http | 5/5 | 4/5 | 1482.29/1646.35 | 1580.75/1894.45 | 480/480 |
+| local_file_raw | base64 | 5/5 | 4/5 | 301.55/321.80 | 392.31/635.83 | 480/480 |
+
+Segmented diagnostics:
+
+| mode | transport | ready | w2m recv | w2m cache | file write | worker pre/total | client rpc | fetch | worker fetch | sidecar/fallback |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| cpu_memory | local_path | 14.60 | 107.41 | 107.52 | 0.00 | 13.38/15.80 | 37.75 | 37.79 | 69.66 | 3.65/1.35 |
+| cpu_memory | http | 20.00 | 70.05 | 70.14 | 0.00 | 15.62/20.08 | 37.30 | 37.39 | 38.47 | 5.00/0.00 |
+| cpu_memory | base64 | 10.80 | 73.61 | 73.77 | 0.00 | 20.33/23.77 | 23.92 | 23.97 | 75.35 | 2.70/2.30 |
+| local_file_npy | local_path | 20.00 | 0.90 | 1.08 | 2.94 | 20.23/27.35 | 4.91 | 4.96 | 6.93 | 5.00/0.00 |
+| local_file_npy | http | 20.00 | 1.01 | 1.86 | 3.06 | 20.86/29.57 | 4.45 | 4.50 | 6.99 | 5.00/0.00 |
+| local_file_npy | base64 | 20.00 | 2.99 | 4.21 | 3.28 | 21.96/30.04 | 4.20 | 4.22 | 5.57 | 5.00/0.00 |
+| local_file_raw | local_path | 20.00 | 0.86 | 1.04 | 3.70 | 21.29/29.63 | 4.90 | 4.96 | 6.48 | 5.00/0.00 |
+| local_file_raw | http | 20.00 | 1.09 | 1.88 | 3.06 | 16.95/25.13 | 4.43 | 4.48 | 6.20 | 5.00/0.00 |
+| local_file_raw | base64 | 20.00 | 4.64 | 5.84 | 4.40 | 25.19/35.50 | 3.76 | 3.79 | 5.03 | 5.00/0.00 |
+
+Conclusion:
+
+```text
+Raw local-file payload is not a safe default. It improves HTTP 20-image TTFT and
+E2E versus npy in this run, but regresses local_path and base64. The segmented
+metrics also show raw does not reliably reduce file-write time; base64 raw has
+higher write and worker total time than npy.
+
+Keep raw as an opt-in experiment/debug mode. The default local_file npy path
+remains the recommended path because it is faster on local_path/base64 and still
+keeps worker-to-manager payload transfer near 1-4 ms instead of the 70-100+ ms
+seen in cpu_memory.
+```
