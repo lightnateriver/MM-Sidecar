@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import threading
 import time
+import math
 from dataclasses import dataclass
 from typing import Any, cast
 
@@ -122,6 +123,8 @@ class SidecarManager:
         self._worker_loads = {
             worker_id: 0 for worker_id in range(self._worker_pool.worker_count)
         }
+        self._worker_fetch_profiles: dict[str, list[dict[str, Any]]] = {}
+        self._worker_fetch_profile_order: list[str] = []
         self._lock = threading.RLock()
         self._ready_drain_stop = threading.Event()
         self._ready_drain_thread: threading.Thread | None = None
@@ -601,6 +604,71 @@ class SidecarManager:
                 reusable_cache_bytes=cache_stats["reusable_bytes"],
                 active_inflight_items=cache_stats["inflight_items"],
             )
+
+    def record_worker_fetch_profile(
+        self,
+        request_id: str,
+        profile: dict[str, Any],
+    ) -> None:
+        request_key = str(request_id)
+        sanitized = self._sanitize_worker_fetch_profile(profile)
+        if not sanitized:
+            return
+        sanitized["request_id"] = request_key
+        sanitized["observed_at_ms"] = _now_ms()
+        with self._lock:
+            if request_key not in self._worker_fetch_profiles:
+                self._worker_fetch_profiles[request_key] = []
+                self._worker_fetch_profile_order.append(request_key)
+            rows = self._worker_fetch_profiles[request_key]
+            rows.append(sanitized)
+            del rows[:-64]
+            while len(self._worker_fetch_profile_order) > 256:
+                evicted_key = self._worker_fetch_profile_order.pop(0)
+                self._worker_fetch_profiles.pop(evicted_key, None)
+
+    def list_worker_fetch_profiles(
+        self,
+        request_id: str,
+    ) -> tuple[dict[str, Any], ...]:
+        with self._lock:
+            return tuple(
+                dict(row)
+                for row in self._worker_fetch_profiles.get(str(request_id), ())
+            )
+
+    def _sanitize_worker_fetch_profile(
+        self,
+        profile: dict[str, Any],
+    ) -> dict[str, Any]:
+        sanitized: dict[str, Any] = {}
+        for key, value in profile.items():
+            if not isinstance(key, str):
+                continue
+            if isinstance(value, bool):
+                sanitized[key] = value
+                continue
+            if isinstance(value, (int, float)):
+                numeric = float(value)
+                if math.isfinite(numeric):
+                    sanitized[key] = numeric
+                continue
+            if isinstance(value, str):
+                sanitized[key] = value
+                continue
+            if isinstance(value, (list, tuple)):
+                items: list[Any] = []
+                for item in value[:128]:
+                    if isinstance(item, bool):
+                        items.append(item)
+                    elif isinstance(item, (int, float)):
+                        numeric = float(item)
+                        if math.isfinite(numeric):
+                            items.append(numeric)
+                    elif isinstance(item, str):
+                        items.append(item)
+                sanitized[key] = items
+        return sanitized
 
     def _ensure_entry_for_descriptor(self, descriptor: FallbackDescriptor) -> _ManagedEntry:
         cache_key = descriptor.cache_key

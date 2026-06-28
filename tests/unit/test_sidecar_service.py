@@ -204,6 +204,41 @@ class SidecarServiceTests(unittest.TestCase):
                     service.join(timeout=2.0)
                     service.terminate()
 
+    def test_service_records_worker_fetch_profiles(self) -> None:
+        service = SidecarServiceProcess(
+            SidecarServiceConfig(
+                worker_pool_mode="inline",
+                manager=SidecarManagerConfig(
+                    workers=WorkerPoolConfig(worker_count=1),
+                ),
+            )
+        )
+        client = service.start()
+        try:
+            client.record_worker_fetch_profile(
+                "req-profile",
+                {
+                    "profile_type": "vit_dp_shard_fetch",
+                    "client_rpc_total": 12.5,
+                    "fetch_ms": 3.25,
+                    "worker_fetch_total_ms": 9.75,
+                    "local_request_media_indexes": [0, 2],
+                },
+            )
+            profiles = client.list_worker_fetch_profiles("req-profile")
+            self.assertEqual(len(profiles), 1)
+            self.assertEqual(profiles[0]["request_id"], "req-profile")
+            self.assertEqual(profiles[0]["profile_type"], "vit_dp_shard_fetch")
+            self.assertEqual(profiles[0]["client_rpc_total"], 12.5)
+            self.assertEqual(profiles[0]["local_request_media_indexes"], [0.0, 2.0])
+            self.assertIn("observed_at_ms", profiles[0])
+        finally:
+            try:
+                client.shutdown()
+            finally:
+                service.join(timeout=2.0)
+                service.terminate()
+
     def test_service_process_worker_pool_can_spawn_workers(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             image_path = Path(tmpdir) / "service-process.jpg"

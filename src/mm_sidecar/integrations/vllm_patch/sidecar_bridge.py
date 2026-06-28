@@ -662,13 +662,74 @@ def _deserialize_handle(payload: dict[str, Any]) -> SidecarHandle:
     )
 
 
+def _summarize_numeric_rows(rows: list[dict[str, Any]]) -> dict[str, dict[str, float]]:
+    stage_names = sorted(
+        {
+            key
+            for row in rows
+            for key, value in row.items()
+            if isinstance(value, (int, float)) and not isinstance(value, bool)
+        }
+    )
+    return {
+        "avg": {
+            stage: sum(float(row.get(stage, 0.0)) for row in rows) / len(rows)
+            for stage in stage_names
+        },
+        "max": {
+            stage: max(float(row.get(stage, 0.0)) for row in rows)
+            for stage in stage_names
+        },
+        "sum": {
+            stage: sum(float(row.get(stage, 0.0)) for row in rows)
+            for stage in stage_names
+        },
+    }
+
+
+def _refresh_worker_fetch_profile_for_debug(capture: RequestCapture) -> None:
+    manager = capture.sidecar_manager
+    if manager is None:
+        return
+    list_profiles = getattr(manager, "list_worker_fetch_profiles", None)
+    if not callable(list_profiles):
+        return
+    try:
+        raw_profiles = list_profiles(capture.request_id)
+    except Exception as exc:
+        capture.add_error(
+            "worker fetch profile refresh failed: "
+            f"{exc.__class__.__name__}: {exc}"
+        )
+        return
+    profiles = [
+        dict(profile)
+        for profile in raw_profiles
+        if isinstance(profile, dict)
+    ]
+    if not profiles:
+        return
+    summary = _summarize_numeric_rows(profiles)
+    payload = {
+        "request_id": capture.request_id,
+        "profile_count": len(profiles),
+        "profiles": profiles,
+        **summary,
+    }
+    capture.worker_fetch_profile = payload
+    if capture.sidecar_prepare is not None:
+        capture.sidecar_prepare["worker_fetch_profile"] = payload
+
+
 def refresh_capture_for_debug(capture: RequestCapture) -> None:
     payload = capture.sidecar_prepare
     manager = capture.sidecar_manager
     if payload is None or manager is None:
+        _refresh_worker_fetch_profile_for_debug(capture)
         return
     raw_handles = payload.get("handles")
     if not isinstance(raw_handles, list) or not raw_handles:
+        _refresh_worker_fetch_profile_for_debug(capture)
         return
 
     handles = [
@@ -677,6 +738,7 @@ def refresh_capture_for_debug(capture: RequestCapture) -> None:
         if isinstance(item, dict)
     ]
     if not handles:
+        _refresh_worker_fetch_profile_for_debug(capture)
         return
 
     snapshots = manager.batch_get_status(handles)
@@ -709,6 +771,7 @@ def refresh_capture_for_debug(capture: RequestCapture) -> None:
                 for stage in stage_names
             },
         }
+    _refresh_worker_fetch_profile_for_debug(capture)
 
 
 def prepare_capture_for_sidecar(

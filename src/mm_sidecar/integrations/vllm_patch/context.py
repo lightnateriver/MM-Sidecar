@@ -80,6 +80,7 @@ class RequestCapture:
     images: list[dict[str, Any]] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
     sidecar_prepare: dict[str, Any] | None = None
+    worker_fetch_profile: dict[str, Any] | None = None
     _captured_refs: list[tuple[int, str, CapturedImageRef]] = field(default_factory=list)
     _normalized_images: list[tuple[int, str, NormalizedImage]] = field(default_factory=list)
     _prepared_descriptors: dict[int, Any] = field(default_factory=dict)
@@ -215,6 +216,7 @@ class RequestCapture:
             "prompt_mm_uuids": dict(self.prompt_mm_uuids),
             "images": images,
             "sidecar_prepare": self.sidecar_prepare,
+            "worker_fetch_profile": self.worker_fetch_profile,
             "errors": list(self.errors),
         }
 

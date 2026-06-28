@@ -415,6 +415,19 @@ class SidecarClient:
     def stats(self):
         return self._request("stats")
 
+    def record_worker_fetch_profile(
+        self,
+        request_id: str,
+        profile: dict[str, Any],
+    ) -> None:
+        self._request("record_worker_fetch_profile", request_id, profile)
+
+    def list_worker_fetch_profiles(
+        self,
+        request_id: str,
+    ):
+        return self._request("list_worker_fetch_profiles", request_id)
+
     def shutdown(self) -> None:
         self._request("shutdown")
 

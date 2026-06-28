@@ -24,9 +24,10 @@ from mm_sidecar.integrations.vllm_patch.sidecar_bridge import (
     build_fallback_descriptors,
     prepare_capture_for_sidecar,
     prepare_single_capture_item_for_sidecar,
+    refresh_capture_for_debug,
 )
 from mm_sidecar.sidecar import InlineProcessorWorkerPool, SidecarManager
-from mm_sidecar.sidecar.protocol import SidecarState, SidecarStatusSnapshot
+from mm_sidecar.sidecar.protocol import SidecarHandle, SidecarState, SidecarStatusSnapshot
 
 
 def _make_image() -> Image.Image:
@@ -293,6 +294,78 @@ class VllmPatchSidecarBridgeTests(unittest.TestCase):
             )
             self.assertIs(cached_payload, payload)
             manager.close()
+
+    def test_refresh_capture_for_debug_exposes_worker_fetch_profile(self) -> None:
+        handle = SidecarHandle(
+            request_id="req-debug-profile",
+            request_media_index=0,
+            cache_key="cache-debug-profile",
+            epoch=1,
+        )
+        manager = mock.Mock()
+        manager.batch_get_status.return_value = (
+            SidecarStatusSnapshot(
+                handle=handle,
+                state=SidecarState.READY,
+                epoch=handle.epoch,
+                updated_at_ms=123.0,
+            ),
+        )
+        manager.list_worker_fetch_profiles.return_value = (
+            {
+                "request_id": "req-debug-profile",
+                "profile_type": "vit_dp_shard_fetch",
+                "rank": 0.0,
+                "client_rpc_total": 8.0,
+                "fetch_ms": 3.0,
+                "worker_fetch_total_ms": 10.0,
+                "fetch_sidecar_count": 4.0,
+            },
+            {
+                "request_id": "req-debug-profile",
+                "profile_type": "vit_dp_shard_fetch",
+                "rank": 1.0,
+                "client_rpc_total": 12.0,
+                "fetch_ms": 5.0,
+                "worker_fetch_total_ms": 14.0,
+                "fetch_local_fallback_count": 2.0,
+            },
+        )
+        capture = RequestCapture(
+            request_id="req-debug-profile",
+            method="POST",
+            path="/v1/chat/completions",
+            sidecar_manager=manager,
+        )
+        capture.set_sidecar_prepare(
+            {
+                "handles": [
+                    {
+                        "request_id": handle.request_id,
+                        "request_media_index": handle.request_media_index,
+                        "cache_key": handle.cache_key,
+                        "epoch": handle.epoch,
+                    }
+                ]
+            }
+        )
+
+        refresh_capture_for_debug(capture)
+
+        assert capture.worker_fetch_profile is not None
+        self.assertEqual(capture.worker_fetch_profile["profile_count"], 2)
+        self.assertEqual(capture.worker_fetch_profile["avg"]["client_rpc_total"], 10.0)
+        self.assertEqual(capture.worker_fetch_profile["max"]["fetch_ms"], 5.0)
+        self.assertEqual(capture.worker_fetch_profile["sum"]["worker_fetch_total_ms"], 24.0)
+        assert capture.sidecar_prepare is not None
+        self.assertIs(
+            capture.sidecar_prepare["worker_fetch_profile"],
+            capture.worker_fetch_profile,
+        )
+        self.assertEqual(
+            capture.to_dict()["worker_fetch_profile"]["avg"]["client_rpc_total"],
+            10.0,
+        )
 
     def test_prepare_capture_for_sidecar_bypasses_single_image_by_default(self) -> None:
         previous = os.environ.pop("MM_SIDECAR_MIN_IMAGE_COUNT", None)

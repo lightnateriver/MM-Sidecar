@@ -1128,6 +1128,37 @@ def reset_worker_sidecar_client_cache() -> None:
         _CLIENT_CACHE = _CLIENT_UNSET
 
 
+def _record_worker_fetch_profile(
+    request_id: str,
+    diagnostics: dict[str, float],
+    *,
+    profile_type: str,
+    role: TpWorkerRole | None = None,
+    local_request_media_indexes: tuple[int, ...] | list[int] | None = None,
+) -> None:
+    if not _worker_fetch_profile_enabled():
+        return
+    client = get_worker_sidecar_client(required=False)
+    if client is None:
+        return
+    profile: dict[str, Any] = dict(diagnostics)
+    profile["profile_type"] = profile_type
+    if role is not None:
+        profile["rank"] = role.local_rank
+        profile["world_size"] = role.world_size
+    if local_request_media_indexes is not None:
+        profile["local_request_media_indexes"] = [
+            int(index) for index in local_request_media_indexes
+        ]
+    try:
+        client.record_worker_fetch_profile(request_id, profile)
+    except Exception as exc:
+        _emit_worker_debug(
+            "record_worker_fetch_profile failed "
+            f"req={request_id} error={exc.__class__.__name__}: {exc}"
+        )
+
+
 def _get_sidecar_payload_from_mm_features(req_state: Any) -> dict[str, Any] | None:
     mm_features = getattr(req_state, "mm_features", None)
     if not isinstance(mm_features, list):
@@ -2122,6 +2153,13 @@ def _fetch_vit_dp_shard_pixel_values(
     diagnostics["worker_fetch_total_ms"] = (
         time.perf_counter() - total_start
     ) * 1000.0
+    _record_worker_fetch_profile(
+        local_items[0].binding.request_id,
+        diagnostics,
+        profile_type="vit_dp_shard_fetch",
+        role=role,
+        local_request_media_indexes=local_media_indexes,
+    )
     for item in local_items:
         setattr(item.req_state, "mm_sidecar_last_fetch_profile_ms", diagnostics)
     return pixel_tensors, diagnostics
@@ -2678,6 +2716,19 @@ def _try_execute_vit_dp_sidecar_direct_encode(
         ) * 1000.0
         setattr(req_state, "mm_sidecar_last_fetch_profile_ms", diagnostics)
         setattr(model_runner, "mm_sidecar_last_fetch_profile_ms", diagnostics)
+        _record_worker_fetch_profile(
+            plan.binding.request_id,
+            diagnostics,
+            profile_type=(
+                "shard_fetch_direct_encode"
+                if shard_fetch_direct_requested
+                else "direct_encode"
+            ),
+            role=role,
+            local_request_media_indexes=tuple(
+                int(plan.image_input_ids[index]) for index in plan.local_indices
+            ) if hasattr(plan, "image_input_ids") else tuple(),
+        )
         handled_reqs.append(req_id)
         debug_extra = ""
         if _worker_fetch_profile_enabled():
@@ -2950,6 +3001,15 @@ def try_replace_scheduled_mm_inputs_from_sidecar(
             }
             setattr(req_state, "mm_sidecar_last_fetch_profile_ms", fetch_profile)
             setattr(model_runner, "mm_sidecar_last_fetch_profile_ms", fetch_profile)
+            _record_worker_fetch_profile(
+                binding.request_id,
+                fetch_profile,
+                profile_type="feature_replacement",
+                role=role,
+                local_request_media_indexes=[
+                    int(descriptor.request_media_index) for descriptor in descriptors
+                ],
+            )
             if _worker_fetch_profile_enabled():
                 _emit_worker_debug(
                     "fetch_profile "
