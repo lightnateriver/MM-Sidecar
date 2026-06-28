@@ -76,17 +76,26 @@ def _make_artifact(index: int = 0) -> PreparedArtifact:
     )
 
 
-def _make_local_file_artifact(path: Path, index: int = 0) -> PreparedArtifact:
+def _make_local_file_artifact(
+    path: Path,
+    index: int = 0,
+    *,
+    payload_format: str = "npy",
+) -> PreparedArtifact:
     signature = _make_signature()
     grid_thw = (1, 36, 20)
     pixel_values = np.arange(720 * 588, dtype=np.float32).reshape(720, 588)
     with open(path, "wb") as handle:
-        np.save(handle, pixel_values, allow_pickle=False)
+        if payload_format == "raw":
+            handle.write(pixel_values.tobytes(order="C"))
+        else:
+            np.save(handle, pixel_values, allow_pickle=False)
     ref = LocalFileTensorPayloadRef(
         path=str(path),
         shape=tuple(int(dim) for dim in pixel_values.shape),
         dtype=str(pixel_values.dtype),
         nbytes=int(pixel_values.nbytes),
+        format=payload_format,
     )
     descriptor = ArtifactDescriptor(
         artifact_id="artifact-adapter-local-file",
@@ -151,6 +160,19 @@ class VllmPatchQwenAdapterTests(unittest.TestCase):
     def test_sidecar_artifact_to_qwen_mm_kwargs_item_loads_local_file_ref(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             artifact = _make_local_file_artifact(Path(tmpdir) / "payload.npy")
+            item = sidecar_artifact_to_qwen_mm_kwargs_item(artifact)
+
+        self.assertIn("pixel_values", item)
+        self.assertEqual(tuple(item["pixel_values"].data.shape), (720, 588))
+        self.assertEqual(float(item["pixel_values"].data[0, 0]), 0.0)
+        self.assertEqual(float(item["pixel_values"].data[-1, -1]), float(720 * 588 - 1))
+
+    def test_sidecar_artifact_to_qwen_mm_kwargs_item_loads_raw_local_file_ref(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            artifact = _make_local_file_artifact(
+                Path(tmpdir) / "payload.raw",
+                payload_format="raw",
+            )
             item = sidecar_artifact_to_qwen_mm_kwargs_item(artifact)
 
         self.assertIn("pixel_values", item)

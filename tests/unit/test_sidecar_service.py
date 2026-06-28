@@ -326,6 +326,7 @@ class SidecarServiceTests(unittest.TestCase):
                     )
                     ref = artifact.payload.pixel_values
                     assert isinstance(ref, LocalFileTensorPayloadRef)
+                    self.assertEqual(ref.format, "npy")
                     ref_path = Path(ref.path)
                     self.assertTrue(ref_path.exists())
                     array = load_local_file_tensor_ref(ref)
@@ -337,6 +338,62 @@ class SidecarServiceTests(unittest.TestCase):
                         "payload_local_file_write_ms",
                         artifact.fetch_diagnostics_ms,
                     )
+                finally:
+                    try:
+                        client.shutdown()
+                    finally:
+                        service.join(timeout=2.0)
+                        service.terminate()
+                self.assertIsNotNone(ref_path)
+                assert ref_path is not None
+                self.assertFalse(ref_path.exists())
+
+    def test_service_process_worker_pool_can_return_raw_local_file_payload_ref(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            image_path = Path(tmpdir) / "service-raw-local-file.jpg"
+            image_path.write_bytes(_make_jpeg_bytes())
+            payload_dir = Path(tmpdir) / "payloads"
+            service = SidecarServiceProcess(
+                SidecarServiceConfig(
+                    worker_pool_mode="process",
+                    start_method="fork",
+                    manager=SidecarManagerConfig(
+                        cache=MemoryCacheConfig(max_reusable_bytes=8 * 1024 * 1024),
+                        workers=WorkerPoolConfig(worker_count=1, start_method="fork"),
+                    ),
+                )
+            )
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "MM_SIDECAR_PAYLOAD_STORAGE": "local_file",
+                    "MM_SIDECAR_PAYLOAD_FILE_FORMAT": "raw",
+                    "MM_SIDECAR_PAYLOAD_DIR": str(payload_dir),
+                },
+            ):
+                client = service.start()
+                ref_path: Path | None = None
+                try:
+                    descriptor = _build_local_descriptor(image_path)
+                    handles = client.prepare([descriptor])
+                    ready = client.wait_for_states(handles, {SidecarState.READY}, 1000.0)
+                    self.assertEqual(ready[0].state, SidecarState.READY)
+                    artifact = client.fetch_ready(handles[0])
+                    self.assertIsNotNone(artifact)
+                    assert artifact is not None
+                    self.assertEqual(artifact.descriptor.storage_kind, StorageKind.LOCAL_FILE)
+                    self.assertEqual(artifact.payload.storage_kind, StorageKind.LOCAL_FILE)
+                    ref = artifact.payload.pixel_values
+                    self.assertIsInstance(ref, LocalFileTensorPayloadRef)
+                    assert isinstance(ref, LocalFileTensorPayloadRef)
+                    self.assertEqual(ref.format, "raw")
+                    ref_path = Path(ref.path)
+                    self.assertEqual(ref_path.suffix, ".raw")
+                    self.assertTrue(ref_path.exists())
+                    self.assertEqual(ref_path.stat().st_size, ref.nbytes)
+                    array = load_local_file_tensor_ref(ref)
+                    self.assertEqual(tuple(array.shape), tuple(artifact.payload.payload_shape))
+                    self.assertEqual(str(array.dtype), artifact.payload.payload_dtype)
                 finally:
                     try:
                         client.shutdown()
