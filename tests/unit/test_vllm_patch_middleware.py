@@ -96,6 +96,7 @@ class VllmPatchMiddlewareTests(unittest.TestCase):
 
         self.assertEqual(app.calls, ["/v1/models"])
         self.assertIsNotNone(state.mm_sidecar_last_capture)
+        self.assertIsNotNone(state.mm_sidecar_last_capture_obj)
         assert state.mm_sidecar_last_capture is not None
         self.assertEqual(state.mm_sidecar_last_capture["path"], "/v1/models")
         self.assertEqual(state.mm_sidecar_last_capture["status_code"], 200)

@@ -91,6 +91,7 @@ class _RequestCaptureMiddleware:
                 response_started = True
                 capture.finalize(status_code=message.get("status"))
                 refresh_capture_for_debug(capture)
+                self.app_state.mm_sidecar_last_capture_obj = capture
                 self.app_state.mm_sidecar_last_capture = capture.to_dict()
 
                 raw_headers = list(message.get("headers") or [])
@@ -111,12 +112,14 @@ class _RequestCaptureMiddleware:
             capture.add_error(f"request failed: {exc.__class__.__name__}: {exc}")
             capture.finalize(status_code=500)
             refresh_capture_for_debug(capture)
+            self.app_state.mm_sidecar_last_capture_obj = capture
             self.app_state.mm_sidecar_last_capture = capture.to_dict()
             raise
         finally:
             if not response_started and capture.finished_at_ms is None:
                 capture.finalize(status_code=None)
                 refresh_capture_for_debug(capture)
+                self.app_state.mm_sidecar_last_capture_obj = capture
                 self.app_state.mm_sidecar_last_capture = capture.to_dict()
             reset_current_capture(token)
 
@@ -293,6 +296,7 @@ def _install_request_capture_middleware(app: Any) -> None:
         return
 
     app.state._mm_sidecar_capture_installed = True
+    app.state.mm_sidecar_last_capture_obj = None
     app.state.mm_sidecar_last_capture = None
     service_config = sidecar_service_config_from_env(required=False)
     app.state.mm_sidecar_client = connect_sidecar_client_from_env(required=False)
@@ -329,6 +333,12 @@ def _install_request_capture_middleware(app: Any) -> None:
         from fastapi import HTTPException
 
         async def mm_sidecar_last_capture() -> dict[str, Any]:
+            capture = getattr(app.state, "mm_sidecar_last_capture_obj", None)
+            if capture is not None:
+                refresh_capture_for_debug(capture)
+                payload = capture.to_dict()
+                app.state.mm_sidecar_last_capture = payload
+                return payload
             payload = getattr(app.state, "mm_sidecar_last_capture", None)
             if payload is None:
                 raise HTTPException(status_code=404, detail="no capture available")
