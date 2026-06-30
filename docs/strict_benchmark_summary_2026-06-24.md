@@ -948,3 +948,92 @@ remains the recommended path because it is faster on local_path/base64 and still
 keeps worker-to-manager payload transfer near 1-4 ms instead of the 70-100+ ms
 seen in cpu_memory.
 ```
+
+## TP2 BF16 Local-File Payload Experiment
+
+BF16 local-file payload formats were tested to see whether halving the payload
+file size would reduce TP worker payload load time enough to beat the default
+`.npy + fp32` path.
+
+Experimental commits:
+
+```text
+53dcaf0 perf: add bf16 local file payload backends
+40db8fd docs: document bf16 payload experiment modes
+2d5c593 perf: surface payload load timings in worker profiles
+```
+
+After strict testing, the BF16 payload backends were removed from mainline:
+
+```text
+e2b8cd6 Revert "docs: document bf16 payload experiment modes"
+b0aed33 Revert "perf: add bf16 local file payload backends"
+```
+
+The generic payload-load profile fields from `2d5c593` remain useful for the
+default npy path and were kept.
+
+Remote artifact:
+
+```text
+/root/mm-sidecar-e2e/strict_bf16_payload_profile_seed202606301735_20260630_173336
+```
+
+Strict protocol:
+
+```text
+TP2 + --mm-encoder-tp-mode data + --enforce-eager
+MM processor workers: 32
+worker/control CPU affinity enabled
+Vit-DP shard-fetch enabled
+payload storage: local_file
+warmup 3 + measured 5
+transports: local_path, http, base64
+image count: 20
+same seed across npy_fp32 / torch_bf16 / numpy_bf16
+all image references unique: 480/480 per mode
+```
+
+E2E comparison:
+
+| mode | transport | success | semantic | TTFT avg/max ms | E2E avg/max ms | unique |
+|---|---|---:|---:|---:|---:|---:|
+| npy_fp32 | local_path | 5/5 | 4/5 | 328.49/345.19 | 419.18/668.97 | 480/480 |
+| npy_fp32 | http | 5/5 | 5/5 | 1476.40/1590.65 | 1508.40/1623.14 | 480/480 |
+| npy_fp32 | base64 | 5/5 | 4/5 | 309.95/334.80 | 396.53/643.77 | 480/480 |
+| torch_bf16 | local_path | 5/5 | 4/5 | 310.39/354.63 | 401.63/627.71 | 480/480 |
+| torch_bf16 | http | 5/5 | 5/5 | 1543.60/1634.69 | 1573.71/1665.26 | 480/480 |
+| torch_bf16 | base64 | 5/5 | 4/5 | 354.02/377.89 | 440.60/673.26 | 480/480 |
+| numpy_bf16 | local_path | 5/5 | 4/5 | 297.00/321.76 | 382.26/618.10 | 480/480 |
+| numpy_bf16 | http | 5/5 | 5/5 | 1548.93/1649.65 | 1579.27/1682.42 | 480/480 |
+| numpy_bf16 | base64 | 5/5 | 4/5 | 344.48/354.87 | 434.36/680.23 | 480/480 |
+
+Payload-load diagnostics:
+
+| mode | transport | stored MB | payload load | to dtype | artifact to tensor | worker fetch total |
+|---|---|---:|---:|---:|---:|---:|
+| npy_fp32 | local_path | 17.34 | 0.92 | 0.02 | 1.49 | 6.80 |
+| npy_fp32 | http | 13.98 | 1.47 | 0.02 | 2.39 | 7.90 |
+| npy_fp32 | base64 | 17.52 | 0.94 | 0.02 | 1.53 | 5.48 |
+| torch_bf16 | local_path | 8.67 | 5.48 | 5.67 | 11.96 | 15.50 |
+| torch_bf16 | http | 7.52 | 6.96 | 5.90 | 14.16 | 20.60 |
+| torch_bf16 | base64 | 8.85 | 4.64 | 3.78 | 9.34 | 15.89 |
+| numpy_bf16 | local_path | 8.40 | 0.71 | 4.65 | 6.47 | 11.55 |
+| numpy_bf16 | http | 7.34 | 1.22 | 10.53 | 13.66 | 20.27 |
+| numpy_bf16 | base64 | 8.85 | 0.76 | 3.80 | 5.69 | 13.32 |
+
+Conclusion:
+
+```text
+Do not keep BF16 payload backends in mainline.
+
+torch_bf16 halves file size but adds enough torch.load and bf16->fp32 cast cost
+to make worker_fetch_total consistently worse than npy_fp32 in this strict run.
+numpy_bf16 has cheaper file load than torch_bf16, but still pays dtype-convert
+cost and does not beat npy_fp32 consistently across transports.
+
+The default remains local_file + npy + fp32. Future payload optimization should
+focus on avoiding the fp32 materialization/cast path entirely, or moving toward
+a direct tensor handoff that matches the ViT input dtype without adding
+serialization overhead.
+```

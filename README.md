@@ -11,6 +11,11 @@
 - API prepare 热路径里的同步统计与 preview 计算已移出主路径。
 - sidecar 主代码已支持正式 CPU affinity 配置：
   `MM_SIDECAR_WORKER_CPU_SET`、`MM_SIDECAR_CONTROL_CPU_SET`。
+- 当前推荐数据面是 `MM_SIDECAR_PAYLOAD_STORAGE=local_file` +
+  `MM_SIDECAR_PAYLOAD_FILE_FORMAT=npy` + `MM_SIDECAR_PAYLOAD_DTYPE=fp32`。
+  `raw` 仅保留为 opt-in 实验格式；bf16 payload 后端已按 strict 结果移除。
+- TP2 多卡路径使用 vLLM `--mm-encoder-tp-mode data`，并由 worker 侧
+  ViT-DP shard-fetch 从 sidecar 拉取当前 rank 需要的图像 payload。
 - 当前仓库可直接用于 sidecar + patched vLLM 联调、strict benchmark 和远端复测。
 
 ## 仓库结构
@@ -56,6 +61,9 @@ MM_SIDECAR_WORKER_COUNT=32 \
 MM_SIDECAR_WORKER_POOL_MODE=process \
 MM_SIDECAR_WORKER_CPU_SET=0-31 \
 MM_SIDECAR_CONTROL_CPU_SET=32-47 \
+MM_SIDECAR_PAYLOAD_STORAGE=local_file \
+MM_SIDECAR_PAYLOAD_FILE_FORMAT=npy \
+MM_SIDECAR_PAYLOAD_DTYPE=fp32 \
 PYTHONPATH=/root/mm-sidecar-with-phase/src \
 taskset -c 0-47 /root/miniconda3/bin/python -m mm_sidecar.sidecar.launcher
 ```
@@ -71,6 +79,9 @@ MM_SIDECAR_SOCKET_PATH=/tmp/mm-sidecar-e2e.sock \
 MM_SIDECAR_DESCRIPTOR_ONLY_CAPTURE=1 \
 MM_SIDECAR_METADATA_WAIT_MS=2 \
 MM_SIDECAR_ENABLE_DEBUG_ROUTE=1 \
+MM_SIDECAR_WORKER_FETCH_PROFILE=1 \
+MM_SIDECAR_ENABLE_VIT_DP_SHARD_FETCH=1 \
+MM_SIDECAR_ENABLE_VIT_DP_DIRECT_ENCODE=0 \
 taskset -c 96-143 /root/miniconda3/bin/python \
   -m mm_sidecar.integrations.vllm_patch.launcher \
   --model /autodl-fs/data/qwen3.5-0.8b \
@@ -81,6 +92,8 @@ taskset -c 96-143 /root/miniconda3/bin/python \
   --trust-remote-code \
   --allowed-local-media-path /root/mm-sidecar-e2e \
   --max-num-seqs 1 \
+  --tensor-parallel-size 2 \
+  --mm-encoder-tp-mode data \
   --enforce-eager \
   --no-enable-log-requests
 ```
