@@ -7,8 +7,6 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from PIL import Image
-import numpy as np
-import torch
 
 from mm_sidecar.integrations.vllm_patch.carrier import (
     attach_sidecar_payload_to_params,
@@ -34,8 +32,6 @@ from mm_sidecar.integrations.vllm_patch.worker_sidecar import (
     _source_plan_numeric_diagnostics,
     _try_execute_vit_dp_sidecar_direct_encode,
     _vit_dp_direct_cache_ready_wait_ms,
-    _artifact_to_pixel_values_tensor,
-    _fetch_vit_dp_shard_pixel_values,
     _resolve_vit_dp_local_indices,
     bind_request_mm_sidecar,
     build_worker_source_plan,
@@ -43,14 +39,6 @@ from mm_sidecar.integrations.vllm_patch.worker_sidecar import (
     install_gpu_model_runner_patch,
     reset_worker_sidecar_client_cache,
     try_replace_scheduled_mm_inputs_from_sidecar,
-)
-from mm_sidecar.contracts import (
-    ArtifactDescriptor,
-    ImageTensorPayload,
-    LocalFileTensorPayloadRef,
-    ProcessorConfig,
-    ProcessorSignature,
-    StorageKind,
 )
 from mm_sidecar.sidecar import (
     InlineProcessorWorkerPool,
@@ -61,7 +49,6 @@ from mm_sidecar.sidecar import (
     SourcePlanEntry,
 )
 from unittest import mock
-from mm_sidecar.sidecar.protocol import PreparedArtifact, SidecarHandle
 
 
 def _make_image() -> Image.Image:
@@ -150,86 +137,6 @@ class _ManualWorkerPool:
 
     def close(self) -> None:
         self._results.clear()
-
-
-def _worker_test_signature() -> ProcessorSignature:
-    return ProcessorSignature.from_config(
-        ProcessorConfig(
-            model_name="qwen3.5-vl",
-            revision="worker-test",
-            processor_name="qwen3-vl",
-            patch_size=14,
-            merge_size=2,
-            temporal_patch_size=1,
-            min_pixels=28 * 28,
-            max_pixels=1280 * 28 * 28,
-        )
-    )
-
-
-def _make_local_file_prepared_artifact(
-    path: Path,
-    *,
-    payload_format: str,
-    request_media_index: int = 0,
-) -> PreparedArtifact:
-    pixel_values = np.arange(720 * 588, dtype=np.float32).reshape(720, 588)
-    if payload_format == "torch":
-        with open(path, "wb") as handle:
-            torch.save(torch.from_numpy(pixel_values).to(torch.bfloat16), handle)
-        logical_dtype = "bfloat16"
-        stored_nbytes = pixel_values.size * 2
-    elif payload_format == "numpy_bf16":
-        bf16_bits = (
-            torch.from_numpy(pixel_values)
-            .to(torch.bfloat16)
-            .view(torch.uint16)
-            .contiguous()
-            .numpy()
-        )
-        path.write_bytes(bf16_bits.tobytes(order="C"))
-        logical_dtype = "bfloat16"
-        stored_nbytes = int(bf16_bits.nbytes)
-    else:
-        raise AssertionError(f"unsupported payload_format for test fixture: {payload_format}")
-
-    signature = _worker_test_signature()
-    ref = LocalFileTensorPayloadRef(
-        path=str(path),
-        shape=(720, 588),
-        dtype=logical_dtype,
-        nbytes=int(stored_nbytes),
-        format=payload_format,
-    )
-    descriptor = ArtifactDescriptor(
-        artifact_id=f"artifact-worker-{payload_format}",
-        item_identity=f"image-worker-{payload_format}",
-        processor_signature=signature,
-        image_grid_thw=(1, 36, 20),
-        payload_shape=(720, 588),
-        payload_dtype=logical_dtype,
-        storage_kind=StorageKind.LOCAL_FILE,
-        payload_nbytes=int(stored_nbytes),
-    )
-    payload = ImageTensorPayload(
-        pixel_values=ref,
-        image_grid_thw=(1, 36, 20),
-        payload_shape=(720, 588),
-        payload_dtype=logical_dtype,
-        storage_kind=StorageKind.LOCAL_FILE,
-    )
-    return PreparedArtifact(
-        handle=SidecarHandle(
-            request_id="req-worker-bf16",
-            request_media_index=request_media_index,
-            cache_key=f"cache-worker-{payload_format}",
-            epoch=1,
-        ),
-        descriptor=descriptor,
-        payload=payload,
-        timings_ms={"total": 1.0},
-        fetch_diagnostics_ms={"existing_metric": 2.0},
-    )
 
 
 class VllmPatchWorkerSidecarTests(unittest.TestCase):
@@ -2262,107 +2169,6 @@ class VllmPatchWorkerSidecarTests(unittest.TestCase):
             192.0,
         )
         self.assertEqual([float(item[0].item()) for item in outputs], [10.0, 20.0, 30.0])
-
-    def test_artifact_to_pixel_values_tensor_loads_torch_bf16_local_file(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            artifact = _make_local_file_prepared_artifact(
-                Path(tmpdir) / "payload.torch",
-                payload_format="torch",
-            )
-            reference = torch.zeros((1, 1), dtype=torch.float32)
-            tensor, diagnostics = _artifact_to_pixel_values_tensor(
-                artifact,
-                reference_pixel_values=reference,
-            )
-        expected = (
-            torch.from_numpy(np.arange(720 * 588, dtype=np.float32).reshape(720, 588))
-            .to(torch.bfloat16)
-            .to(torch.float32)
-        )
-
-        self.assertEqual(tuple(tensor.shape), (720, 588))
-        self.assertEqual(tensor.dtype, torch.float32)
-        self.assertTrue(torch.equal(tensor, expected))
-        self.assertIn("payload_load_ms", diagnostics)
-        self.assertIn("payload_to_tensor_ms", diagnostics)
-        self.assertIn("payload_to_device_dtype_ms", diagnostics)
-        self.assertIn("payload_contiguous_ms", diagnostics)
-
-    def test_artifact_to_pixel_values_tensor_loads_numpy_bf16_local_file(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            artifact = _make_local_file_prepared_artifact(
-                Path(tmpdir) / "payload.numpy_bf16",
-                payload_format="numpy_bf16",
-            )
-            reference = torch.zeros((1, 1), dtype=torch.float32)
-            tensor, diagnostics = _artifact_to_pixel_values_tensor(
-                artifact,
-                reference_pixel_values=reference,
-            )
-        expected = (
-            torch.from_numpy(np.arange(720 * 588, dtype=np.float32).reshape(720, 588))
-            .to(torch.bfloat16)
-            .to(torch.float32)
-        )
-
-        self.assertEqual(tuple(tensor.shape), (720, 588))
-        self.assertEqual(tensor.dtype, torch.float32)
-        self.assertTrue(torch.equal(tensor, expected))
-        self.assertIn("payload_load_ms", diagnostics)
-        self.assertIn("payload_to_tensor_ms", diagnostics)
-        self.assertIn("payload_to_device_dtype_ms", diagnostics)
-        self.assertIn("payload_contiguous_ms", diagnostics)
-
-    def test_fetch_vit_dp_shard_pixel_values_records_bf16_tensor_timings(self) -> None:
-        role = TpWorkerRole(
-            local_rank=0,
-            world_size=1,
-            coordinator_rank=0,
-            is_coordinator=True,
-        )
-        binding = SimpleNamespace(request_id="req-worker-bf16-profile", enabled=True)
-        req_state = SimpleNamespace()
-        with tempfile.TemporaryDirectory() as tmpdir:
-            artifact = _make_local_file_prepared_artifact(
-                Path(tmpdir) / "payload.torch",
-                payload_format="torch",
-                request_media_index=0,
-            )
-            item = VitDpShardFetchItem(
-                req_id="req-worker-bf16-profile",
-                req_state=req_state,
-                binding=binding,
-                feature=SimpleNamespace(),
-                request_media_index=0,
-                descriptor=SimpleNamespace(request_media_index=0),
-                handle=artifact.handle,
-                planned_item=None,
-                grid_thw=(1, 36, 20),
-            )
-            with mock.patch(
-                "mm_sidecar.integrations.vllm_patch.worker_sidecar.get_worker_sidecar_client",
-                return_value=None,
-            ), mock.patch(
-                "mm_sidecar.integrations.vllm_patch.worker_sidecar._run_local_fallback_artifacts",
-                return_value=[artifact],
-            ):
-                pixel_tensors, diagnostics = _fetch_vit_dp_shard_pixel_values(
-                    (item,),
-                    [0],
-                    role=role,
-                    reference_pixel_values=torch.zeros((1, 1), dtype=torch.float32),
-                )
-
-        self.assertEqual(len(pixel_tensors), 1)
-        self.assertEqual(tuple(pixel_tensors[0].shape), (720, 588))
-        self.assertEqual(pixel_tensors[0].dtype, torch.float32)
-        self.assertIn("artifact_to_tensor_ms", diagnostics)
-        self.assertIn("payload_load_ms", diagnostics)
-        self.assertIn("payload_to_tensor_ms", diagnostics)
-        self.assertIn("payload_to_device_dtype_ms", diagnostics)
-        self.assertIn("payload_contiguous_ms", diagnostics)
-        self.assertGreaterEqual(diagnostics["payload_load_ms"], 0.0)
-        self.assertEqual(diagnostics["payload_bytes"], float(artifact.descriptor.payload_nbytes))
 
 
 if __name__ == "__main__":

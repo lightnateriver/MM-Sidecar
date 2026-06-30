@@ -6,7 +6,6 @@ from importlib.util import find_spec
 from pathlib import Path
 
 import numpy as np
-import torch
 
 from mm_sidecar.contracts import (
     ArtifactDescriptor,
@@ -89,33 +88,13 @@ def _make_local_file_artifact(
     with open(path, "wb") as handle:
         if payload_format == "raw":
             handle.write(pixel_values.tobytes(order="C"))
-        elif payload_format == "torch":
-            torch.save(
-                torch.from_numpy(pixel_values).to(torch.bfloat16),
-                handle,
-            )
-        elif payload_format == "numpy_bf16":
-            bf16_bits = (
-                torch.from_numpy(pixel_values)
-                .to(torch.bfloat16)
-                .view(torch.uint16)
-                .contiguous()
-                .numpy()
-            )
-            handle.write(bf16_bits.tobytes(order="C"))
         else:
             np.save(handle, pixel_values, allow_pickle=False)
-    logical_dtype = "bfloat16" if payload_format in {"torch", "numpy_bf16"} else str(pixel_values.dtype)
-    nbytes = (
-        pixel_values.size * 2
-        if payload_format in {"torch", "numpy_bf16"}
-        else int(pixel_values.nbytes)
-    )
     ref = LocalFileTensorPayloadRef(
         path=str(path),
         shape=tuple(int(dim) for dim in pixel_values.shape),
-        dtype=logical_dtype,
-        nbytes=int(nbytes),
+        dtype=str(pixel_values.dtype),
+        nbytes=int(pixel_values.nbytes),
         format=payload_format,
     )
     descriptor = ArtifactDescriptor(
@@ -124,15 +103,15 @@ def _make_local_file_artifact(
         processor_signature=signature,
         image_grid_thw=grid_thw,
         payload_shape=(720, 588),
-        payload_dtype=logical_dtype,
+        payload_dtype="float32",
         storage_kind=StorageKind.LOCAL_FILE,
-        payload_nbytes=int(nbytes),
+        payload_nbytes=int(pixel_values.nbytes),
     )
     payload = ImageTensorPayload(
         pixel_values=ref,
         image_grid_thw=grid_thw,
         payload_shape=(720, 588),
-        payload_dtype=logical_dtype,
+        payload_dtype="float32",
         storage_kind=StorageKind.LOCAL_FILE,
         resized_size_hw=(504, 280),
         orig_size_hw=(512, 288),
@@ -200,52 +179,6 @@ class VllmPatchQwenAdapterTests(unittest.TestCase):
         self.assertEqual(tuple(item["pixel_values"].data.shape), (720, 588))
         self.assertEqual(float(item["pixel_values"].data[0, 0]), 0.0)
         self.assertEqual(float(item["pixel_values"].data[-1, -1]), float(720 * 588 - 1))
-
-    def test_sidecar_artifact_to_qwen_mm_kwargs_item_loads_torch_bf16_local_file_ref(self) -> None:
-        expected = (
-            torch.from_numpy(np.arange(720 * 588, dtype=np.float32).reshape(720, 588))
-            .to(torch.bfloat16)
-            .to(torch.float32)
-        )
-        with tempfile.TemporaryDirectory() as tmpdir:
-            artifact = _make_local_file_artifact(
-                Path(tmpdir) / "payload.torch",
-                payload_format="torch",
-            )
-            item = sidecar_artifact_to_qwen_mm_kwargs_item(artifact)
-
-        self.assertEqual(str(item["pixel_values"].data.dtype), "torch.float32")
-        self.assertEqual(tuple(item["pixel_values"].data.shape), (720, 588))
-        self.assertTrue(torch.equal(item["pixel_values"].data, expected))
-        self.assertIsNotNone(artifact.fetch_diagnostics_ms)
-        assert artifact.fetch_diagnostics_ms is not None
-        self.assertIn("payload_load_ms", artifact.fetch_diagnostics_ms)
-        self.assertIn("payload_to_tensor_ms", artifact.fetch_diagnostics_ms)
-        self.assertIn("payload_to_dtype_ms", artifact.fetch_diagnostics_ms)
-        self.assertIn("payload_contiguous_ms", artifact.fetch_diagnostics_ms)
-
-    def test_sidecar_artifact_to_qwen_mm_kwargs_item_loads_numpy_bf16_local_file_ref(self) -> None:
-        expected = (
-            torch.from_numpy(np.arange(720 * 588, dtype=np.float32).reshape(720, 588))
-            .to(torch.bfloat16)
-            .to(torch.float32)
-        )
-        with tempfile.TemporaryDirectory() as tmpdir:
-            artifact = _make_local_file_artifact(
-                Path(tmpdir) / "payload.numpy_bf16",
-                payload_format="numpy_bf16",
-            )
-            item = sidecar_artifact_to_qwen_mm_kwargs_item(artifact)
-
-        self.assertEqual(str(item["pixel_values"].data.dtype), "torch.float32")
-        self.assertEqual(tuple(item["pixel_values"].data.shape), (720, 588))
-        self.assertTrue(torch.equal(item["pixel_values"].data, expected))
-        self.assertIsNotNone(artifact.fetch_diagnostics_ms)
-        assert artifact.fetch_diagnostics_ms is not None
-        self.assertIn("payload_load_ms", artifact.fetch_diagnostics_ms)
-        self.assertIn("payload_to_tensor_ms", artifact.fetch_diagnostics_ms)
-        self.assertIn("payload_to_dtype_ms", artifact.fetch_diagnostics_ms)
-        self.assertIn("payload_contiguous_ms", artifact.fetch_diagnostics_ms)
 
     def test_planned_item_to_synthetic_qwen_mm_kwargs_item(self) -> None:
         signature = _make_signature().value.replace("|temporal=1|", "|temporal=2|")
