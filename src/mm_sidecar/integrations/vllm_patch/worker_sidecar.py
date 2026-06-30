@@ -2004,23 +2004,57 @@ def _artifact_to_pixel_values_tensor(
     artifact: Any,
     *,
     reference_pixel_values: Any,
-) -> Any:
+) -> tuple[Any, dict[str, float]]:
     import torch
 
     payload = getattr(artifact, "payload", None)
     raw_pixel_values = getattr(payload, "pixel_values", None)
     if raw_pixel_values is None:
         raise RuntimeError("sidecar artifact missing pixel_values payload")
+    diagnostics = {
+        "payload_load_ms": 0.0,
+        "payload_to_tensor_ms": 0.0,
+        "payload_to_device_dtype_ms": 0.0,
+        "payload_contiguous_ms": 0.0,
+    }
     if isinstance(raw_pixel_values, torch.Tensor):
         tensor = raw_pixel_values
     elif isinstance(raw_pixel_values, LocalFileTensorPayloadRef):
-        tensor = torch.from_numpy(load_local_file_tensor_ref(raw_pixel_values))
+        load_started = time.perf_counter()
+        loaded_value = load_local_file_tensor_ref(raw_pixel_values)
+        diagnostics["payload_load_ms"] = (
+            time.perf_counter() - load_started
+        ) * 1000.0
+        to_tensor_started = time.perf_counter()
+        if isinstance(loaded_value, torch.Tensor):
+            tensor = loaded_value
+        else:
+            tensor = torch.from_numpy(loaded_value)
+            if raw_pixel_values.format == "numpy_bf16":
+                tensor = tensor.view(torch.bfloat16)
+        diagnostics["payload_to_tensor_ms"] = (
+            time.perf_counter() - to_tensor_started
+        ) * 1000.0
     else:
+        to_tensor_started = time.perf_counter()
         tensor = torch.as_tensor(raw_pixel_values)
-    return tensor.to(
+        diagnostics["payload_to_tensor_ms"] = (
+            time.perf_counter() - to_tensor_started
+        ) * 1000.0
+    to_device_started = time.perf_counter()
+    tensor = tensor.to(
         device=reference_pixel_values.device,
         dtype=reference_pixel_values.dtype,
-    ).contiguous()
+    )
+    diagnostics["payload_to_device_dtype_ms"] = (
+        time.perf_counter() - to_device_started
+    ) * 1000.0
+    contiguous_started = time.perf_counter()
+    tensor = tensor.contiguous()
+    diagnostics["payload_contiguous_ms"] = (
+        time.perf_counter() - contiguous_started
+    ) * 1000.0
+    return tensor, diagnostics
 
 
 def _fetch_vit_dp_shard_pixel_values(
@@ -2129,6 +2163,12 @@ def _fetch_vit_dp_shard_pixel_values(
     }
     pixel_tensors: list[Any] = []
     tensor_start = time.perf_counter()
+    tensor_diagnostics = {
+        "payload_load_ms": 0.0,
+        "payload_to_tensor_ms": 0.0,
+        "payload_to_device_dtype_ms": 0.0,
+        "payload_contiguous_ms": 0.0,
+    }
     for item in local_items:
         artifact = artifact_by_index.get(item.request_media_index)
         if artifact is None:
@@ -2136,15 +2176,17 @@ def _fetch_vit_dp_shard_pixel_values(
                 "vit dp shard fetch missing artifact for "
                 f"media index {item.request_media_index}"
             )
-        pixel_tensors.append(
-            _artifact_to_pixel_values_tensor(
-                artifact,
-                reference_pixel_values=reference_pixel_values,
-            )
+        pixel_tensor, per_artifact_diagnostics = _artifact_to_pixel_values_tensor(
+            artifact,
+            reference_pixel_values=reference_pixel_values,
         )
+        pixel_tensors.append(pixel_tensor)
+        for key, value in per_artifact_diagnostics.items():
+            tensor_diagnostics[key] = tensor_diagnostics.get(key, 0.0) + float(value)
     diagnostics["artifact_to_tensor_ms"] = (
         time.perf_counter() - tensor_start
     ) * 1000.0
+    diagnostics.update(tensor_diagnostics)
 
     diagnostics.update(_merge_fetch_diagnostics(artifacts))
     diagnostics["payload_bytes"] = float(_artifact_payload_bytes(artifacts))

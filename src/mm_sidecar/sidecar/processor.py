@@ -387,9 +387,14 @@ def _complete_payload_task(
 ) -> tuple[ArtifactDescriptor, ImageTensorPayload, dict[str, float]]:
     descriptor, payload = _build_image_tensor_payload(image, task.descriptor, plan)
     after_preprocess = time.perf_counter()
-    payload_local_file_write_ms = 0.0
+    payload_store_metrics: dict[str, float] = {
+        "payload_tensor_cast_ms": 0.0,
+        "payload_torch_save_ms": 0.0,
+        "payload_numpy_bf16_save_ms": 0.0,
+        "payload_local_file_write_ms": 0.0,
+    }
     if task.assigned_worker_id >= 0 and local_file_payload_enabled():
-        descriptor, payload, payload_local_file_write_ms = (
+        descriptor, payload, payload_store_details = (
             materialize_payload_to_local_file(
                 cache_key=task.cache_key,
                 epoch=task.epoch,
@@ -397,11 +402,19 @@ def _complete_payload_task(
                 payload=payload,
             )
         )
+        payload_store_metrics.update(
+            {
+                key: float(value)
+                for key, value in payload_store_details.items()
+                if isinstance(value, (int, float))
+            }
+        )
     after_payload_ready = time.perf_counter()
     completed_timings_ms = {
         **timings_ms,
         "preprocess": (after_preprocess - after_probe) * 1000.0,
-        "payload_local_file_write_ms": payload_local_file_write_ms,
+        **payload_store_metrics,
+        "payload_stored_nbytes": float(payload.nbytes),
         "total": (after_payload_ready - started_at) * 1000.0,
     }
     return descriptor, payload, completed_timings_ms

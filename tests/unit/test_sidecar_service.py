@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import tempfile
+import time
 import unittest
 from io import BytesIO
 from pathlib import Path
@@ -103,6 +104,21 @@ def _build_local_descriptor(path: Path, item_index: int = 0) -> FallbackDescript
         item_identity=f"local:{path.name}:{item_index}",
         orig_size_hw=normalized.orig_size_hw,
     )
+
+
+def _wait_for_ready_artifact(
+    client,
+    handle,
+    *,
+    timeout_s: float = 10.0,
+    poll_interval_s: float = 0.02,
+):
+    deadline = time.monotonic() + timeout_s
+    artifact = client.fetch_ready(handle)
+    while artifact is None and time.monotonic() < deadline:
+        time.sleep(poll_interval_s)
+        artifact = client.fetch_ready(handle)
+    return artifact
 
 
 class SidecarServiceTests(unittest.TestCase):
@@ -294,10 +310,10 @@ class SidecarServiceTests(unittest.TestCase):
             service = SidecarServiceProcess(
                 SidecarServiceConfig(
                     worker_pool_mode="process",
-                    start_method="fork",
+                    start_method="spawn",
                     manager=SidecarManagerConfig(
                         cache=MemoryCacheConfig(max_reusable_bytes=8 * 1024 * 1024),
-                        workers=WorkerPoolConfig(worker_count=1, start_method="fork"),
+                        workers=WorkerPoolConfig(worker_count=1, start_method="spawn"),
                     ),
                 )
             )
@@ -313,9 +329,7 @@ class SidecarServiceTests(unittest.TestCase):
                 try:
                     descriptor = _build_local_descriptor(image_path)
                     handles = client.prepare([descriptor])
-                    ready = client.wait_for_states(handles, {SidecarState.READY}, 1000.0)
-                    self.assertEqual(ready[0].state, SidecarState.READY)
-                    artifact = client.fetch_ready(handles[0])
+                    artifact = _wait_for_ready_artifact(client, handles[0])
                     self.assertIsNotNone(artifact)
                     assert artifact is not None
                     self.assertEqual(artifact.descriptor.storage_kind, StorageKind.LOCAL_FILE)
@@ -356,10 +370,10 @@ class SidecarServiceTests(unittest.TestCase):
             service = SidecarServiceProcess(
                 SidecarServiceConfig(
                     worker_pool_mode="process",
-                    start_method="fork",
+                    start_method="spawn",
                     manager=SidecarManagerConfig(
                         cache=MemoryCacheConfig(max_reusable_bytes=8 * 1024 * 1024),
-                        workers=WorkerPoolConfig(worker_count=1, start_method="fork"),
+                        workers=WorkerPoolConfig(worker_count=1, start_method="spawn"),
                     ),
                 )
             )
@@ -376,9 +390,7 @@ class SidecarServiceTests(unittest.TestCase):
                 try:
                     descriptor = _build_local_descriptor(image_path)
                     handles = client.prepare([descriptor])
-                    ready = client.wait_for_states(handles, {SidecarState.READY}, 1000.0)
-                    self.assertEqual(ready[0].state, SidecarState.READY)
-                    artifact = client.fetch_ready(handles[0])
+                    artifact = _wait_for_ready_artifact(client, handles[0])
                     self.assertIsNotNone(artifact)
                     assert artifact is not None
                     self.assertEqual(artifact.descriptor.storage_kind, StorageKind.LOCAL_FILE)
@@ -394,6 +406,119 @@ class SidecarServiceTests(unittest.TestCase):
                     array = load_local_file_tensor_ref(ref)
                     self.assertEqual(tuple(array.shape), tuple(artifact.payload.payload_shape))
                     self.assertEqual(str(array.dtype), artifact.payload.payload_dtype)
+                finally:
+                    try:
+                        client.shutdown()
+                    finally:
+                        service.join(timeout=2.0)
+                        service.terminate()
+                self.assertIsNotNone(ref_path)
+                assert ref_path is not None
+                self.assertFalse(ref_path.exists())
+
+    def test_service_process_worker_pool_can_return_torch_bf16_local_file_payload_ref(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            image_path = Path(tmpdir) / "service-torch-bf16-local-file.jpg"
+            image_path.write_bytes(_make_jpeg_bytes())
+            payload_dir = Path(tmpdir) / "payloads"
+            service = SidecarServiceProcess(
+                SidecarServiceConfig(
+                    worker_pool_mode="process",
+                    start_method="spawn",
+                    manager=SidecarManagerConfig(
+                        cache=MemoryCacheConfig(max_reusable_bytes=8 * 1024 * 1024),
+                        workers=WorkerPoolConfig(worker_count=1, start_method="spawn"),
+                    ),
+                )
+            )
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "MM_SIDECAR_PAYLOAD_STORAGE": "local_file",
+                    "MM_SIDECAR_PAYLOAD_FILE_FORMAT": "torch",
+                    "MM_SIDECAR_PAYLOAD_DTYPE": "bf16",
+                    "MM_SIDECAR_PAYLOAD_DIR": str(payload_dir),
+                },
+            ):
+                client = service.start()
+                ref_path: Path | None = None
+                try:
+                    descriptor = _build_local_descriptor(image_path)
+                    handles = client.prepare([descriptor])
+                    artifact = _wait_for_ready_artifact(client, handles[0])
+                    self.assertIsNotNone(artifact)
+                    assert artifact is not None
+                    ref = artifact.payload.pixel_values
+                    self.assertIsInstance(ref, LocalFileTensorPayloadRef)
+                    assert isinstance(ref, LocalFileTensorPayloadRef)
+                    self.assertEqual(ref.format, "torch")
+                    self.assertEqual(ref.dtype, "bfloat16")
+                    ref_path = Path(ref.path)
+                    self.assertTrue(ref_path.exists())
+                    tensor = load_local_file_tensor_ref(ref)
+                    self.assertEqual(str(tensor.dtype), "torch.bfloat16")
+                    self.assertEqual(tuple(tensor.shape), tuple(artifact.payload.payload_shape))
+                    self.assertIsNotNone(artifact.fetch_diagnostics_ms)
+                    assert artifact.fetch_diagnostics_ms is not None
+                    self.assertIn("payload_torch_save_ms", artifact.fetch_diagnostics_ms)
+                finally:
+                    try:
+                        client.shutdown()
+                    finally:
+                        service.join(timeout=2.0)
+                        service.terminate()
+                self.assertIsNotNone(ref_path)
+                assert ref_path is not None
+                self.assertFalse(ref_path.exists())
+
+    def test_service_process_worker_pool_can_return_numpy_bf16_local_file_payload_ref(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            image_path = Path(tmpdir) / "service-numpy-bf16-local-file.jpg"
+            image_path.write_bytes(_make_jpeg_bytes())
+            payload_dir = Path(tmpdir) / "payloads"
+            service = SidecarServiceProcess(
+                SidecarServiceConfig(
+                    worker_pool_mode="process",
+                    start_method="spawn",
+                    manager=SidecarManagerConfig(
+                        cache=MemoryCacheConfig(max_reusable_bytes=8 * 1024 * 1024),
+                        workers=WorkerPoolConfig(worker_count=1, start_method="spawn"),
+                    ),
+                )
+            )
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "MM_SIDECAR_PAYLOAD_STORAGE": "local_file",
+                    "MM_SIDECAR_PAYLOAD_FILE_FORMAT": "numpy_bf16",
+                    "MM_SIDECAR_PAYLOAD_DTYPE": "bf16",
+                    "MM_SIDECAR_PAYLOAD_DIR": str(payload_dir),
+                },
+            ):
+                client = service.start()
+                ref_path: Path | None = None
+                try:
+                    descriptor = _build_local_descriptor(image_path)
+                    handles = client.prepare([descriptor])
+                    artifact = _wait_for_ready_artifact(client, handles[0])
+                    self.assertIsNotNone(artifact)
+                    assert artifact is not None
+                    ref = artifact.payload.pixel_values
+                    self.assertIsInstance(ref, LocalFileTensorPayloadRef)
+                    assert isinstance(ref, LocalFileTensorPayloadRef)
+                    self.assertEqual(ref.format, "numpy_bf16")
+                    self.assertEqual(ref.dtype, "bfloat16")
+                    ref_path = Path(ref.path)
+                    self.assertTrue(ref_path.exists())
+                    array = load_local_file_tensor_ref(ref)
+                    self.assertEqual(str(array.dtype), "uint16")
+                    self.assertEqual(tuple(array.shape), tuple(artifact.payload.payload_shape))
+                    self.assertIsNotNone(artifact.fetch_diagnostics_ms)
+                    assert artifact.fetch_diagnostics_ms is not None
+                    self.assertIn(
+                        "payload_numpy_bf16_save_ms",
+                        artifact.fetch_diagnostics_ms,
+                    )
                 finally:
                     try:
                         client.shutdown()

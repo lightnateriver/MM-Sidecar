@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import json
+import time
 from typing import Any
 
 import numpy as np
 
 from mm_sidecar.contracts import LocalFileTensorPayloadRef, ProcessorSignature
-from mm_sidecar.sidecar.artifact_store import load_local_file_tensor_ref
+from mm_sidecar.sidecar.artifact_store import (
+    load_local_file_tensor_ref,
+    local_file_ref_storage_dtype,
+)
 from mm_sidecar.sidecar.protocol import PreparedArtifact
 
 SYNTHETIC_PLACEHOLDER_ATTR = "_mm_sidecar_synthetic_placeholder"
@@ -48,20 +52,69 @@ def _int_signature_value(
         return default
 
 
-def _to_torch_tensor(value: Any, *, dtype: Any | None = None):
+def _to_torch_tensor(
+    value: Any,
+    *,
+    dtype: Any | None = None,
+    return_diagnostics: bool = False,
+):
     import torch
 
+    diagnostics = {
+        "payload_load_ms": 0.0,
+        "payload_to_tensor_ms": 0.0,
+        "payload_to_dtype_ms": 0.0,
+        "payload_contiguous_ms": 0.0,
+    }
     if isinstance(value, torch.Tensor):
         tensor = value
     elif isinstance(value, LocalFileTensorPayloadRef):
-        tensor = torch.from_numpy(load_local_file_tensor_ref(value))
+        load_started = time.perf_counter()
+        loaded_value = load_local_file_tensor_ref(value)
+        diagnostics["payload_load_ms"] = (
+            time.perf_counter() - load_started
+        ) * 1000.0
+        to_tensor_started = time.perf_counter()
+        if isinstance(loaded_value, torch.Tensor):
+            tensor = loaded_value
+        else:
+            tensor = torch.from_numpy(loaded_value)
+            if value.format == "numpy_bf16":
+                storage_dtype = local_file_ref_storage_dtype(value)
+                if storage_dtype != "uint16":
+                    raise ValueError(
+                        "numpy_bf16 local tensor payload requires uint16 storage dtype"
+                    )
+                tensor = tensor.view(torch.bfloat16)
+        diagnostics["payload_to_tensor_ms"] = (
+            time.perf_counter() - to_tensor_started
+        ) * 1000.0
     elif isinstance(value, np.ndarray):
+        to_tensor_started = time.perf_counter()
         tensor = torch.from_numpy(value)
+        diagnostics["payload_to_tensor_ms"] = (
+            time.perf_counter() - to_tensor_started
+        ) * 1000.0
     else:
+        to_tensor_started = time.perf_counter()
         tensor = torch.as_tensor(value)
+        diagnostics["payload_to_tensor_ms"] = (
+            time.perf_counter() - to_tensor_started
+        ) * 1000.0
     if dtype is not None:
+        to_dtype_started = time.perf_counter()
         tensor = tensor.to(dtype=dtype)
-    return tensor.contiguous()
+        diagnostics["payload_to_dtype_ms"] = (
+            time.perf_counter() - to_dtype_started
+        ) * 1000.0
+    contiguous_started = time.perf_counter()
+    tensor = tensor.contiguous()
+    diagnostics["payload_contiguous_ms"] = (
+        time.perf_counter() - contiguous_started
+    ) * 1000.0
+    if return_diagnostics:
+        return tensor, diagnostics
+    return tensor
 
 
 def _build_qwen_mm_kwargs_item(
@@ -136,7 +189,21 @@ def sidecar_artifact_to_qwen_mm_kwargs_item(
     import torch
 
     payload = artifact.payload
-    pixel_values = _to_torch_tensor(payload.pixel_values, dtype=torch.float32)
+    pixel_values, tensor_diagnostics = _to_torch_tensor(
+        payload.pixel_values,
+        dtype=torch.float32,
+        return_diagnostics=True,
+    )
+    fetch_diagnostics = (
+        dict(artifact.fetch_diagnostics_ms)
+        if isinstance(artifact.fetch_diagnostics_ms, dict)
+        else {}
+    )
+    fetch_diagnostics.update(tensor_diagnostics)
+    try:
+        object.__setattr__(artifact, "fetch_diagnostics_ms", fetch_diagnostics)
+    except Exception:
+        pass
     image_grid_thw = _to_torch_tensor(
         [payload.image_grid_thw],
         dtype=torch.long,
