@@ -106,6 +106,40 @@ API server:     CPU 96-143
 
 如果不显式设置这两个变量，sidecar 会基于当前进程可见 CPU 集合做默认分配。
 
+## Payload Storage
+
+当前推荐的数据面是 `local_file` + `.npy` + `float32`。三种输入
+`local_path/http/base64` 都会在 sidecar worker 内完成 decode、resize、
+normalize 和 patch flatten，然后把预处理后的 tensor 写成本地 `.npy`，
+TP worker 只从 manager 拿轻量 `LocalFileTensorPayloadRef` 并本地读取文件。
+
+推荐配置：
+
+```bash
+MM_SIDECAR_PAYLOAD_STORAGE=local_file
+MM_SIDECAR_PAYLOAD_FILE_FORMAT=npy
+MM_SIDECAR_PAYLOAD_DTYPE=fp32
+MM_SIDECAR_PAYLOAD_MMAP=1
+```
+
+实验开关：
+
+```bash
+# torch.save(torch.bfloat16 tensor)
+MM_SIDECAR_PAYLOAD_STORAGE=local_file
+MM_SIDECAR_PAYLOAD_FILE_FORMAT=torch
+MM_SIDECAR_PAYLOAD_DTYPE=bf16
+
+# uint16 bf16 bit-pattern, decoded back to torch.bfloat16
+MM_SIDECAR_PAYLOAD_STORAGE=local_file
+MM_SIDECAR_PAYLOAD_FILE_FORMAT=numpy_bf16
+MM_SIDECAR_PAYLOAD_DTYPE=bf16
+```
+
+`torch` 和 `numpy_bf16` 仅用于性能/精度实验，默认不要开启。它们的目标是
+验证提前把 payload 存成 bf16 是否能降低文件大小、TP worker load/cast/H2D
+开销；是否值得启用必须以后续 strict benchmark 和 precision check 为准。
+
 ## Strict benchmark
 
 标准入口：
