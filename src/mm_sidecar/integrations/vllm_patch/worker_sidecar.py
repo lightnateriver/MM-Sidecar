@@ -1882,7 +1882,6 @@ def _sidecar_or_fallback_items_for_plan(
         diagnostics["local_fallback_ms"] = (
             time.perf_counter() - fallback_start
         ) * 1000.0
-        diagnostics.update(_merge_fetch_diagnostics(artifacts))
         diagnostics["payload_bytes"] = float(_artifact_payload_bytes(artifacts))
         diagnostics["artifact_count"] = float(len(artifacts))
         convert_start = time.perf_counter()
@@ -1892,6 +1891,10 @@ def _sidecar_or_fallback_items_for_plan(
         diagnostics["artifact_to_mm_kwargs_ms"] = (
             time.perf_counter() - convert_start
         ) * 1000.0
+        diagnostics["artifact_to_tensor_ms"] = diagnostics[
+            "artifact_to_mm_kwargs_ms"
+        ]
+        diagnostics.update(_merge_fetch_diagnostics(artifacts))
         diagnostics["worker_fetch_total_ms"] = (
             time.perf_counter() - total_start
         ) * 1000.0
@@ -1976,7 +1979,6 @@ def _sidecar_or_fallback_items_for_plan(
                 producer_rank=role.local_rank,
             )
         artifacts.extend(local_fallback_artifacts)
-    diagnostics.update(_merge_fetch_diagnostics(artifacts))
     diagnostics["payload_bytes"] = float(_artifact_payload_bytes(artifacts))
     diagnostics["artifact_count"] = float(len(artifacts))
     artifact_by_index = {
@@ -1991,6 +1993,8 @@ def _sidecar_or_fallback_items_for_plan(
     diagnostics["artifact_to_mm_kwargs_ms"] = (
         time.perf_counter() - convert_start
     ) * 1000.0
+    diagnostics["artifact_to_tensor_ms"] = diagnostics["artifact_to_mm_kwargs_ms"]
+    diagnostics.update(_merge_fetch_diagnostics(artifacts))
     diagnostics["worker_fetch_total_ms"] = (
         time.perf_counter() - total_start
     ) * 1000.0
@@ -2989,7 +2993,6 @@ def try_replace_scheduled_mm_inputs_from_sidecar(
                 )
             fetch_ms = (time.perf_counter() - fetch_start) * 1000.0
             artifacts = list(fetch_batch.sidecar_artifacts)
-            fetch_diagnostics_ms = _merge_fetch_diagnostics(artifacts)
             if fetch_batch.fallback_descriptors:
                 if _feature_data_missing_for_descriptors(
                     req_state,
@@ -3034,10 +3037,12 @@ def try_replace_scheduled_mm_inputs_from_sidecar(
                 tuple(artifacts),
             )
             replace_ms = (time.perf_counter() - replace_start) * 1000.0
+            fetch_diagnostics_ms = _merge_fetch_diagnostics(artifacts)
             fetch_profile = {
                 "source_plan_ms": source_plan_ms,
                 "fetch_ms": fetch_ms,
                 "replace_ms": replace_ms,
+                "artifact_to_tensor_ms": replace_ms,
                 "payload_bytes": float(_artifact_payload_bytes(artifacts)),
                 **fetch_diagnostics_ms,
             }

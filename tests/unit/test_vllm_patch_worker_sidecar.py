@@ -735,15 +735,37 @@ class VllmPatchWorkerSidecarTests(unittest.TestCase):
             runner.requests = {"req-worker-ready": req_state}
             scheduler_output = _FakeSchedulerOutput("req-worker-ready")
 
+            def _replace_and_record_payload_load(state, artifacts):
+                raw_fetch_diagnostics = getattr(
+                    artifacts[0],
+                    "fetch_diagnostics_ms",
+                    None,
+                )
+                fetch_diagnostics = (
+                    dict(raw_fetch_diagnostics)
+                    if isinstance(raw_fetch_diagnostics, dict)
+                    else {}
+                )
+                fetch_diagnostics["payload_load_ms"] = 7.0
+                fetch_diagnostics["payload_to_dtype_ms"] = 3.0
+                object.__setattr__(
+                    artifacts[0],
+                    "fetch_diagnostics_ms",
+                    fetch_diagnostics,
+                )
+                setattr(state.mm_features[0], "data", {"pixel_values": "sidecar"})
+                return len(artifacts)
+
             with mock.patch(
                 "mm_sidecar.integrations.vllm_patch.worker_sidecar.get_worker_sidecar_client",
                 return_value=manager,
+            ), mock.patch.dict(
+                os.environ,
+                {"MM_SIDECAR_WORKER_FETCH_PROFILE": "1"},
+                clear=False,
             ), mock.patch(
                 "mm_sidecar.integrations.vllm_patch.worker_sidecar.replace_feature_data_from_sidecar_artifacts",
-                side_effect=lambda state, artifacts: (
-                    setattr(state.mm_features[0], "data", {"pixel_values": "sidecar"})
-                    or len(artifacts)
-                ),
+                side_effect=_replace_and_record_payload_load,
             ):
                 replaced = try_replace_scheduled_mm_inputs_from_sidecar(
                     runner,
@@ -759,6 +781,12 @@ class VllmPatchWorkerSidecarTests(unittest.TestCase):
             self.assertIn("source_plan_ms", profile)
             self.assertIn("fetch_ms", profile)
             self.assertIn("replace_ms", profile)
+            self.assertEqual(profile["payload_load_ms"], 7.0)
+            self.assertEqual(profile["payload_to_dtype_ms"], 3.0)
+            recorded_profiles = manager.list_worker_fetch_profiles("req-worker-ready")
+            self.assertEqual(len(recorded_profiles), 1)
+            self.assertEqual(recorded_profiles[0]["payload_load_ms"], 7.0)
+            self.assertEqual(recorded_profiles[0]["profile_type"], "feature_replacement")
             manager.close()
 
     def test_try_replace_producer_rank_publishes_request_local_fallback(self) -> None:
